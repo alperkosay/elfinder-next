@@ -1,0 +1,47 @@
+{
+  "name": "elfinder-next",
+  "version": "0.1.0",
+  "description": "elFinder 2.1 connector for Next.js App Router API routes",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch"
+  },
+  "keywords": [
+    "elfinder",
+    "nextjs",
+    "file-manager",
+    "connector"
+  ],
+  "license": "MIT",
+  "packageManager": "pnpm@10.32.1",
+  "peerDependencies": {
+    "next": ">=14"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "mime-types": "^3.0.1",
+    "sharp": "^0.34.2"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/mime-types": "^3.0.1",
+    "@types/node": "^20",
+    "next": "^16.2.6",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
