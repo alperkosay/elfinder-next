@@ -14,7 +14,7 @@ export default function Home() {
         Open Picker
       </button>
       <iframe
-        src="/elfinder-static/picker.html"
+        src="/elfinder/picker.html"
         style={{ width: "100%", height: "100%" }}
       ></iframe>
     </div>

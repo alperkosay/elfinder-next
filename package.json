@@ -3,7 +3,7 @@
   "private": true,
   "scripts": {
     "build": "pnpm --filter elfinder-next build",
-    "dev": "pnpm --filter playground dev",
+    "dev": "pnpm --filter elfinder-next build && pnpm --filter playground dev",
     "build:playground": "pnpm --filter elfinder-next build && pnpm --filter playground build"
   },
   "packageManager": "pnpm@10.32.1"

@@ -7,10 +7,46 @@ import sharp from "sharp";
 import type { ElfinderContext } from "./context.js";
 import type { ElfinderFile, ElfinderHandlers } from "./types.js";
 
+// libvips keeps input file handles in its cache; on Windows that blocks unlink (EBUSY).
+sharp.cache({ files: 0 });
+
 type ParamBag = {
   get: (key: string) => string | null;
   getAll: (key: string) => string[];
 };
+
+function isBusyError(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code)
+      : "";
+  return code === "EBUSY" || code === "EPERM";
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function rmWithRetry(
+  absolutePath: string,
+  options?: { recursive?: boolean; force?: boolean },
+  attempts = 5,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await fs.rm(absolutePath, options);
+      return;
+    } catch (error) {
+      lastError = error;
+      if (!isBusyError(error) || attempt === attempts) {
+        throw error;
+      }
+      await sleep(40 * attempt);
+    }
+  }
+  throw lastError;
+}
 
 type ZipAdapter = {
   addLocalFolder: (localPath: string, zipPath?: string) => void;
@@ -151,13 +187,24 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
 
     try {
-      await sharp(resolveWithinRoot(normalized))
+      // Read into a buffer so sharp never holds a path-based lock on the source file.
+      const input = await fs.readFile(resolveWithinRoot(normalized));
+      await sharp(input)
         .resize(48, 48, { fit: "inside", withoutEnlargement: true })
         .png()
         .toFile(thumbPath);
       return thumbName;
     } catch {
       return null;
+    }
+  }
+
+  async function removeThumbForHash(hash: string): Promise<void> {
+    const thumbPath = path.resolve(TMB_DIR, tmbFilenameFromHash(hash));
+    try {
+      await rmWithRetry(thumbPath, { force: true });
+    } catch {
+      // thumbnail may not exist
     }
   }
 
@@ -267,7 +314,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       await fs.rename(src, dst);
     } catch {
       await fs.cp(src, dst, { recursive: true, force: false, errorOnExist: true });
-      await fs.rm(src, { recursive: true, force: true });
+      await rmWithRetry(src, { recursive: true, force: true });
     }
   }
 
@@ -379,7 +426,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         continue;
       }
       const absolute = resolveWithinRoot(relative);
-      await fs.rm(absolute, { recursive: true, force: true });
+      await rmWithRetry(absolute, { recursive: true, force: true });
+      await removeThumbForHash(hash);
       removed.push(hash);
     }
 
