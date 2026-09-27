@@ -667,8 +667,13 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return "application/octet-stream";
   }
 
+  /**
+   * Whether `value` is one of this volume's hashes, which elFinder puts in
+   * upload_path[] in place of a name. Decoding rather than pattern-matching means
+   * a custom volumeId is recognized and a file named like `v2_report` is not.
+   */
   function looksLikeElfinderHash(value: string): boolean {
-    return /^v\d+_[A-Za-z0-9\-_]+$/.test(value);
+    return decodeHashStrict(value) !== null;
   }
 
   function chooseUploadFilename(candidates: Array<string | null | undefined>): string {

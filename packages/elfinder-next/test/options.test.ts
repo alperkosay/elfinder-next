@@ -47,6 +47,33 @@ describe("volume identity", () => {
     expect(body.files.every((f: any) => f.hash.startsWith("v9_"))).toBe(true);
   });
 
+  it("recognizes its own hash in upload_path[] whatever the volume id (item 39)", async () => {
+    // elFinder sends the destination's hash in upload_path[] on a plain upload. The
+    // connector used to spot it with /^v\d+_/, so under "files_" the hash itself
+    // became the file name.
+    const vol = await makeVolume({}, { volumeId: "files_" });
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", "files_Lw");
+    form.append("upload[]", new File(["x"], "photo.txt"));
+    form.append("upload_path[]", "files_Lw");
+
+    await vol.POST(form);
+    expect(await vol.exists("photo.txt")).toBe(true);
+    expect(await vol.exists("files_Lw")).toBe(false);
+  });
+
+  it("keeps a file whose name merely looks like a hash", async () => {
+    const vol = await makeVolume();
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", ROOT_HASH);
+    form.append("upload[]", new File(["x"], "v2_report"));
+
+    await vol.POST(form);
+    expect(await vol.exists("v2_report")).toBe(true);
+  });
+
   it("refuses a hash minted for a different volume id", async () => {
     const vol = await makeVolume({ "src/f.txt": "x" }, { volumeId: "v9_" });
     // A v1_ hash is not ours when volumeId is v9_.
