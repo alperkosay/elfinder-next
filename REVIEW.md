@@ -30,7 +30,9 @@ Tamamlanan maddeler (`fix/security-and-core-hardening` ve `fix/thumbnail-lifecyc
 | 38, 42-45 | Varsayılanlar `public/` dışına alındı, connector üzerinden servis, dağıtım belgeleri (`docs/deployment`) |
 | 56 | README sürüm bilgisi (0.2.0) |
 | 50, 53-55, 57, 58 | Temiz klonda playground, LICENSE, npm metadata, Next 14/15 CI işi (`chore/repo-hygiene`) |
-| 59 | Karara bağlandı: CJS yok, `sideEffects` 35'e bağlı |
+| 59 | Karara bağlandı: CJS yok, `sideEffects: false` 35 ile eklendi |
+| 61 | Ölçüldü: yalnızca workspace bağlantısında, `outputFileTracingExcludes` belgelendi |
+| 34-37, 39-41 | Küçük düzeltmeler, 37 bir izin atlatması çıktı (`fix/small-fixes`) |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -40,15 +42,14 @@ oluyor.
 Komutlar:
 
 ```bash
-pnpm test        # vitest, 194 test
+pnpm test        # vitest, 227 test
 pnpm typecheck   # kaynak + testler
 ```
 
-**Açıkta kalan:** madde 32, 33 (mimari), 34-37, 39-41 (küçük düzeltmeler), 61
-(izleme uyarısının kozmetik kalanı, 32 ile birlikte).
+**Açıkta kalan:** madde 32, 33 (mimari), 12'nin toplam kota kısmı, 61'in kozmetik
+uyarısı (32 ile birlikte).
 
-Sıradaki bloklar: madde 61 ve küçük düzeltmeler (34-37, 39-41, 35 ile birlikte `sideEffects`),
-ve en büyük iş olarak StorageAdapter soyutlaması (32).
+Sıradaki blok: StorageAdapter soyutlaması (32), ardından tembel bağımlılıklar (33).
 
 ---
 
@@ -255,8 +256,8 @@ Yalnızca silinen hedefin thumbnail'i siliniyor. İçinde 100 görsel olan bir k
 
 - [x] `Readable.toWeb` ile akış döndür
 - [x] HTTP Range desteği ekle. Range olmadan video ve ses önizlemesinde ileri sarma çalışmıyor.
-- [ ] Birleştirmeyi `createWriteStream` ile akışa çevir
-- [ ] `maxFileSize`, `maxFiles` ve toplam kota seçenekleri ekle
+- [x] Birleştirmeyi `createWriteStream` ile akışa çevir — `mergeChunks` bunu protokol dalında zaten yapıyordu, kutu işaretlenmemiş kalmıştı
+- [ ] `maxFileSize`, `maxFiles` ve toplam kota seçenekleri ekle — ilk ikisi `maxUploadBytes` ve `maxUploadFiles` olarak var, toplam kota yok
 
 > Gerçek akışlı **yükleme** bu listede yok. `req.formData()` Node runtime'da gövdenin
 > tamamını zaten belleğe alıyor. Onu aşmak busboy gibi kendi multipart ayrıştırıcınızı
@@ -341,14 +342,17 @@ Yaklaşık 30 MB native ikili, bazı serverless platformlarda sorun çıkarıyor
 
 ## P3 — Küçük ama hızlı kazançlar
 
-- [ ] **34.** `dim` ve `resize` komutlarını yaz. sharp zaten bağımlı, ikisi de yaklaşık 20 satır. Şu an "desteklenmiyor" diye duruyorlar.
-- [ ] **35. `handler-core.ts:11`** — `sharp.cache` ayarı modül yüklenirken global değiştiriliyor. Ana uygulamanın sharp davranışını da etkiliyor. En azından belgele, mümkünse kapsamla.
-- [ ] **36.** `ensureUploadDir()` her istekte üç `mkdir` çağırıyor. Sonucu bir promise'te önbellekle.
-- [ ] **37.** `mkdir`, `mkfile` ve `rename` gelen adda `/` veya `\` kontrolü yapmıyor. Kök dışına çıkamıyor ama dosyayı beklenmedik klasöre taşıyabiliyor.
+- [x] **34.** `dim` ve `resize` komutlarını yaz. sharp zaten bağımlı, ikisi de yaklaşık 20 satır. Şu an "desteklenmiyor" diye duruyorlar. — YAPILDI. İstek biçimi istemcinin `resize.js` dosyasından alındı: `resize`, `crop`, `rotate`, JPEG kalitesi, `bg`. Sonuç `.tmp`'de hazırlanıp orijinalin üzerine taşınıyor, kenar 10000 px ile sınırlı. 20 satırdan uzun sürdü.
+- [x] **35. `handler-core.ts:11`** — `sharp.cache` ayarı modül yüklenirken global değiştiriliyor. Ana uygulamanın sharp davranışını da etkiliyor. En azından belgele, mümkünse kapsamla. — YAPILDI, çağrı kaldırıldı. Thumbnail zaten buffer'dan üretildiği için sharp kaynak dosyayı hiç açmıyor. Windows'ta üç koşu üst üste, thumbnail sonrası silme, yeniden adlandırma ve taşıma testleri dahil, sorunsuz. Böylece `sideEffects: false` eklenebildi.
+- [x] **36.** `ensureUploadDir()` her istekte üç `mkdir` çağırıyor. Sonucu bir promise'te önbellekle. — YAPILDI. Hata önbelleğe alınmıyor, thumbnail üretimi `.tmb`'yi kendisi yeniden oluşturuyor.
+- [x] **37.** `mkdir`, `mkfile` ve `rename` gelen adda `/` veya `\` kontrolü yapmıyor. Kök dışına çıkamıyor ama dosyayı beklenmedik klasöre taşıyabiliyor. — YAPILDI, **bulgu büyüdü.**
+  - Madde 14'ün izin kancasını deliyordu: yalnızca hedefin `write` izni kontrol edildiği için `open/`'dan `name=../locked/x` ile yazma izni kapalı `locked/`'a klasör açılabiliyordu. `archive` da aynı açığa sahipti.
+  - Yanında iki sessiz veri kaybı çıktı: `mkfile` var olan dosyayı sıfır bayta indiriyordu (`wx` bayrağı yoktu), `archive` var olan dosyanın üzerine yazıyordu.
+  - Ayraç, `.`, `..` veya kontrol karakteri içeren adlar artık `errInvName` dönüyor. Yükleme adları eskisi gibi `safeSegment` ile kurtarılıyor.
 - [x] **38. `.chunks` dizini `public/` altında.** — YAPILDI, varsayılan `uploadDir` artık `<cwd>/uploads`. Kullanıcı `uploadDir`i elle `public/` altına koyarsa sorun o kurulumda sürüyor, README bunu önermiyor. Yarım kalan yüklemelerin içeriği `/uploads/.chunks/...` adresinden herkese açık. Chunk ve tmb dizinlerini servis edilen kökün dışına taşı.
-- [ ] **39. `looksLikeElfinderHash`** — `/^v\d+_/` kalıbını sabit kodluyor. Özel bir `volumeId` verilirse yükleme dosya adı sezgiseli bozuluyor. `VOLUME_ID` değişkenini kullan.
-- [ ] **40.** `detectMimeFromName` içindeki `.pdf` dalı ölü kod, `mime-types` zaten biliyor.
-- [ ] **41.** Thumbnail ve dosya yanıtlarına `Cache-Control` ekle.
+- [x] **39. `looksLikeElfinderHash`** — `/^v\d+_/` kalıbını sabit kodluyor. Özel bir `volumeId` verilirse yükleme dosya adı sezgiseli bozuluyor. `VOLUME_ID` değişkenini kullan. — YAPILDI, kalıp yerine `decodeHashStrict`. Bu, ikinci bir hatayı da kapattı: `v2_report` adlı sıradan bir dosya hash sanılıp başka adla kaydediliyordu.
+- [x] **40.** `detectMimeFromName` içindeki `.pdf` dalı ölü kod, `mime-types` zaten biliyor. — YAPILDI.
+- [x] **41.** Thumbnail ve dosya yanıtlarına `Cache-Control` ekle. — YAPILDI: `private, no-cache` ile zayıf `ETag` ve `Last-Modified`, eşleşince 304. Adres dosya üzerine yazılınca değişmediği için `max-age` verilmedi. zipdl arşivi `no-store`.
 
 ---
 
