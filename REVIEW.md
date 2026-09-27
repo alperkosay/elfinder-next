@@ -8,7 +8,7 @@ Dosya referansları `packages/elfinder-next/src/` altına göredir.
 
 ## Uygulanan dilim
 
-`fix/security-and-core-hardening` dalında 10 commit. Tamamlanan maddeler:
+`fix/security-and-core-hardening` dalında 13 commit. Tamamlanan maddeler:
 
 | Madde | Konu |
 |---|---|
@@ -25,13 +25,20 @@ Dosya referansları `packages/elfinder-next/src/` altına göredir.
 | 51, 52 | vitest sözleşme testleri ve GitHub Actions CI |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
-doğrulandı. Geçici betikler artık  altında kalıcı
-vitest paketine dönüştü: 99 test, orijinal kaynağa karşı koşturulduğunda 44'ü
-başarısız oluyor.
+doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
+paketine dönüştü: 99 test, orijinal kaynağa karşı koşturulduğunda 44'ü başarısız
+oluyor.
+
+Komutlar:
+
+```bash
+pnpm test        # vitest, 99 test
+pnpm typecheck   # kaynak + testler
+```
 
 **Açıkta kalan, bu dilimde kapsam dışı olanlar:** madde 10 (bayat thumbnail),
 11 (öksüz thumbnail), 13 (chunk çöpü), 14 (auth kancaları), 15-19 ve 21-30
-(protokol), 31-43 (mimari ve dağıtım), 45, 50-59 (hijyen ve testler).
+(protokol), 31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen), 60 (Node 18).
 
 ---
 
