@@ -248,13 +248,24 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return `${VOLUME_ID}${b64}`;
   }
 
-  function decodeHash(hash?: string | null): string {
-    if (!hash || hash === ROOT_HASH) {
+  /**
+   * Decodes a hash, telling "the volume root" apart from "not a hash we issued".
+   *
+   * Returns `""` for the root and `null` when the value cannot be decoded. The
+   * distinction matters: treating an undecodable hash as the root silently sends
+   * pastes and uploads to the top of the volume instead of reporting an error.
+   */
+  function decodeHashStrict(hash?: string | null): string | null {
+    if (!hash) {
+      return null;
+    }
+    if (hash === ROOT_HASH) {
       return "";
     }
     if (!hash.startsWith(VOLUME_ID)) {
-      return "";
+      return null;
     }
+    let normalized: string;
     try {
       const encoded = hash
         .slice(VOLUME_ID.length)
@@ -262,10 +273,36 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         .replace(/-/g, "+")
         .replace(/_/g, "/");
       const padded = encoded + "=".repeat((4 - (encoded.length % 4 || 4)) % 4);
-      return normalizeRelativePath(Buffer.from(padded, "base64").toString("utf8"));
+      normalized = normalizeRelativePath(Buffer.from(padded, "base64").toString("utf8"));
     } catch {
-      return "";
+      return null;
     }
+    if (!normalized) {
+      return null;
+    }
+    // Base64 decoding never fails loudly: arbitrary text decodes to arbitrary
+    // bytes. Re-encoding is the real check — a hash we issued round-trips, and
+    // anything else does not.
+    if (encodeHash(normalized) !== hash) {
+      return null;
+    }
+    return normalized;
+  }
+
+  function decodeHash(hash?: string | null): string {
+    return decodeHashStrict(hash) ?? "";
+  }
+
+  /**
+   * Decodes a hash for a command that cannot fall back to the root, such as the
+   * destination of a paste or an upload.
+   */
+  function requireHash(hash: string | null | undefined, code: string): string {
+    const decoded = decodeHashStrict(hash);
+    if (decoded === null) {
+      throw new ElfinderError(code);
+    }
+    return decoded;
   }
 
   function resolveWithinRoot(relativePath: string): string {
@@ -461,7 +498,51 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return `${base}${suffix}${ext}`;
   }
 
+  /**
+   * True when two paths name the same file on disk.
+   *
+   * Needed so a case-only rename (`Photo.JPG` to `photo.jpg`) is not mistaken for
+   * a collision. Windows and macOS are case-insensitive by default, so the two
+   * spellings are one file there; the inode comparison covers case-sensitive
+   * filesystems, where they are genuinely different.
+   */
+  async function isSameTarget(a: string, b: string): Promise<boolean> {
+    if (a === b) {
+      return true;
+    }
+    if (process.platform !== "linux" && a.toLowerCase() === b.toLowerCase()) {
+      return true;
+    }
+    try {
+      const [statA, statB] = await Promise.all([fs.stat(a), fs.stat(b)]);
+      return statA.dev === statB.dev && statA.ino !== 0 && statA.ino === statB.ino;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Refuses to clobber an existing file.
+   *
+   * `fs.rename` replaces its destination silently on every platform, so without
+   * this a rename or a cut-paste onto an existing name destroys that file with no
+   * error. elFinder responds to errExists by asking the user whether to overwrite
+   * or keep both, which is the decision that was being made for them.
+   */
+  async function assertNotOccupied(destination: string, source?: string): Promise<void> {
+    try {
+      await fs.stat(destination);
+    } catch {
+      return;
+    }
+    if (source && (await isSameTarget(source, destination))) {
+      return;
+    }
+    throw new ElfinderError(["errExists", path.basename(destination)]);
+  }
+
   async function movePath(src: string, dst: string) {
+    await assertNotOccupied(dst, src);
     try {
       await fs.rename(src, dst);
     } catch {
@@ -554,7 +635,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   async function handleMkdir(params: ParamBag) {
-    const target = decodeHash(params.get("target"));
+    const target = requireHash(params.get("target"), "errTrgFolderNotFound");
     const name = (params.get("name") || "New Folder").trim();
     if (!name) {
       throw new ElfinderError("errInvName");
@@ -600,7 +681,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
     const parent = normalizeRelativePath(path.posix.dirname(oldRelative));
     const newRelative = normalizeRelativePath(parent ? `${parent}/${name}` : name);
-    await fs.rename(resolveWithinRoot(oldRelative), resolveWithinRoot(newRelative));
+    const oldAbsolute = resolveWithinRoot(oldRelative);
+    const newAbsolute = resolveWithinRoot(newRelative);
+    await assertNotOccupied(newAbsolute, oldAbsolute);
+    await fs.rename(oldAbsolute, newAbsolute);
 
     return NextResponse.json({
       removed: [targetHash],
@@ -670,7 +754,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   async function handleMkfile(params: ParamBag) {
-    const target = decodeHash(params.get("target"));
+    const target = requireHash(params.get("target"), "errTrgFolderNotFound");
     const name = (params.get("name") || "newfile.txt").trim();
     const relative = normalizeRelativePath(target ? `${target}/${name}` : name);
     await fs.writeFile(resolveWithinRoot(relative), "");
@@ -732,7 +816,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   async function handlePaste(params: ParamBag) {
-    const dst = decodeHash(params.get("dst"));
+    const dst = requireHash(params.get("dst"), "errTrgFolderNotFound");
     const cut = isTruthy(params.get("cut"));
     const renames = new Set(params.getAll("renames[]"));
     const suffix = params.get("suffix") || "_copy";
@@ -757,6 +841,9 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         await movePath(sourceAbs, destAbs);
         removed.push(targetHash);
       } else {
+        // Checked up front so copy and cut report the same errExists with the
+        // conflicting name, rather than copy surfacing a bare EEXIST.
+        await assertNotOccupied(destAbs, sourceAbs);
         await fs.cp(sourceAbs, destAbs, { recursive: true, errorOnExist: true, force: false });
       }
 
@@ -854,7 +941,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   async function handleArchive(params: ParamBag) {
-    const target = decodeHash(params.get("target"));
+    const target = requireHash(params.get("target"), "errTrgFolderNotFound");
     const name = (params.get("name") || "archive.zip").trim();
     const archiveRel = normalizeRelativePath(target ? `${target}/${name}` : name);
     const zip = new (AdmZip as unknown as new () => ZipAdapter)();
@@ -1044,7 +1131,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   async function handleUpload(formData: FormData) {
-    const target = decodeHash(formData.get("target") as string | null);
+    const target = requireHash(
+      formData.get("target") as string | null,
+      "errTrgFolderNotFound",
+    );
     const uploadTarget = resolveWithinRoot(target);
     await fs.mkdir(uploadTarget, { recursive: true });
 
