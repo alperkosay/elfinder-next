@@ -212,3 +212,31 @@ describe("file responses can be revalidated but not reused unchecked (item 41)",
     expect(response.headers.get("etag")).toBeNull();
   });
 });
+
+describe("an aborted download does not crash the process", () => {
+  it("cancels a file body at any point without an uncaught exception", async () => {
+    // On Node 20.3, Readable.toWeb throws "Controller is already closed" out of
+    // the file stream's close event once the body is cancelled. Vitest reports
+    // that as an unhandled error, so this fails if it ever comes back.
+    const vol = await makeVolume({ "a.txt": BODY });
+    for (const wait of [0, 1, 5, 20]) {
+      for (let i = 0; i < 10; i++) {
+        const response = await vol.GET(`cmd=file&target=${hashOf("a.txt")}`);
+        await new Promise((resolve) => setTimeout(resolve, wait));
+        await response.body!.cancel();
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
+  it("still streams the full body and ranges", async () => {
+    const vol = await makeVolume({ "a.txt": BODY });
+    const full = await vol.GET(`cmd=file&target=${hashOf("a.txt")}`);
+    expect(await full.text()).toBe(BODY);
+    const ranged = await vol.GET(`cmd=file&target=${hashOf("a.txt")}`, {
+      headers: { range: "bytes=2-6" },
+    });
+    expect(ranged.status).toBe(206);
+    expect(await ranged.text()).toBe("23456");
+  });
+});
