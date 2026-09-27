@@ -62,13 +62,23 @@ describe("chunked upload cannot write outside the volume (item 1)", () => {
 
   it("still accepts an ordinary chunked upload", async () => {
     const vol = await makeVolume();
-    // A single chunk whose range covers the whole file is the final chunk, so the
-    // connector merges it immediately. elFinder sends the slice as "blob", which
-    // the filename heuristic skips in favour of the name encoded in `chunk`.
-    const form = chunkUpload({ chunk: "report.pdf.0_0.part", cid: "7", total: 4 });
-    form.set("upload[]", new File(["PWND"], "blob"), "blob");
-    const body = await json(await vol.POST(form));
-    expect(body.error).toBeUndefined();
+    // A single slice whose range covers the whole file completes the upload, so the
+    // connector reports it and waits for the merge request. elFinder sends the slice
+    // as "blob", which the filename heuristic skips in favour of the name in `chunk`.
+    const slice = chunkUpload({ chunk: "report.pdf.0_0.part", cid: "7", total: 4 });
+    slice.set("upload[]", new File(["PWND"], "blob"), "blob");
+    const reported = await json(await vol.POST(slice));
+    expect(reported.error).toBeUndefined();
+    expect(reported._chunkmerged).toBe("report.pdf");
+
+    const merge = new FormData();
+    merge.set("cmd", "upload");
+    merge.set("target", ROOT_HASH);
+    merge.set("chunk", reported._chunkmerged);
+    merge.set("cid", "7");
+    merge.append("upload[]", reported._name);
+
+    const body = await json(await vol.POST(merge));
     expect(body.added?.[0]?.name).toBe("report.pdf");
     expect(await vol.read("report.pdf")).toBe("PWND");
   });

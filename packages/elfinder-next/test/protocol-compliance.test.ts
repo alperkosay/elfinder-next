@@ -288,23 +288,92 @@ describe("chunked upload completes on bytes, not offset (item 26)", () => {
     expect(await vol.exists("movie.bin")).toBe(false);
   });
 
-  it("merges in offset order once every slice has landed", async () => {
+  /**
+   * The merge request the client sends on seeing `_chunkmerged`. `upload[]` carries
+   * the name string it was given, not another slice.
+   */
+  function mergeRequest(chunkmerged: string, name: string) {
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", ROOT_HASH);
+    form.set("chunk", chunkmerged);
+    form.set("cid", "42");
+    form.append("upload[]", name);
+    return form;
+  }
+
+  it("reports completion once every slice has landed, without merging yet", async () => {
     const vol = await makeVolume();
     await vol.POST(slice(2, "CCCC", 12));
     await vol.POST(slice(0, "AAAA", 12));
     const body = await json(await vol.POST(slice(1, "BBBB", 12)));
 
+    // The protocol is explicit that these two appear only when every chunk has
+    // arrived, and that the merge happens on the request the client sends next.
+    expect(body.added).toEqual([]);
+    expect(body._chunkmerged).toBe("movie.bin");
+    expect(body._name).toBe("movie.bin");
+    expect(await vol.exists("movie.bin")).toBe(false);
+  });
+
+  it("stays silent about completion on an intermediate slice", async () => {
+    const vol = await makeVolume();
+    const body = await json(await vol.POST(slice(0, "AAAA", 12)));
+
+    expect(body).toEqual({ added: [] });
+  });
+
+  it("merges in offset order on the follow-up request", async () => {
+    const vol = await makeVolume();
+    for (const [index, chunk] of [
+      [2, "CCCC"],
+      [0, "AAAA"],
+      [1, "BBBB"],
+    ] as const) {
+      await vol.POST(slice(index, chunk, 12));
+    }
+
+    const body = await json(await vol.POST(mergeRequest("movie.bin", "movie.bin")));
+
     expect(body.added?.[0]?.name).toBe("movie.bin");
     expect(await vol.read("movie.bin")).toBe("AAAABBBBCCCC");
   });
 
-  it("clears the parts after merging", async () => {
+  it("clears the staging directory after merging", async () => {
     const vol = await makeVolume();
     for (const index of [0, 1, 2]) {
       await vol.POST(slice(index, "XXXX", 12));
     }
-    const left = await fs.readdir(path.join(vol.uploadDir, ".chunks", "42")).catch(() => []);
+    await vol.POST(mergeRequest("movie.bin", "movie.bin"));
+
+    const left = await fs.readdir(path.join(vol.uploadDir, ".chunks")).catch(() => []);
     expect(left).toEqual([]);
+  });
+
+  it("finds the parts even when the merge request omits cid", async () => {
+    // The protocol only promises `chunk` and `upload[]` on this request, so losing cid
+    // must not lose the upload.
+    const vol = await makeVolume();
+    for (const index of [0, 1, 2]) {
+      await vol.POST(slice(index, "YYYY", 12));
+    }
+
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", ROOT_HASH);
+    form.set("chunk", "movie.bin");
+    form.append("upload[]", "movie.bin");
+
+    const body = await json(await vol.POST(form));
+    expect(body.added?.[0]?.name).toBe("movie.bin");
+    expect(await vol.read("movie.bin")).toBe("YYYYYYYYYYYY");
+  });
+
+  it("refuses a merge request for parts that do not exist", async () => {
+    const vol = await makeVolume();
+    expect(await errorOf(await vol.POST(mergeRequest("ghost.bin", "ghost.bin")))).toEqual([
+      "errUploadTemp",
+    ]);
   });
 });
 

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
+import { createReadStream, createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
 import { createHash, randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { Readable } from "stream";
@@ -471,8 +472,15 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
    * the upload and the index orders it. Sorting numerically matters: lexical order
    * puts `.10_` before `.2_` and would concatenate the file scrambled.
    */
+  function chunkBaseName(chunkName: string): string {
+    return chunkName.replace(/\.\d+_\d+\.part$/, "");
+  }
+
   async function chunkPartNames(dir: string, chunkName: string): Promise<string[]> {
-    const base = chunkName.replace(/\.\d+_\d+\.part$/, "");
+    return chunkPartNamesForBase(dir, chunkBaseName(chunkName));
+  }
+
+  async function chunkPartNamesForBase(dir: string, base: string): Promise<string[]> {
     const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const pattern = new RegExp(`^${escaped}\\.(\\d+)_\\d+\\.part$`);
 
@@ -1831,6 +1839,116 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
   }
 
+  /**
+   * Performs the merge the client asks for after a chunked upload reports completion.
+   *
+   * The staging directory is normally found from `cid`, but the protocol only promises
+   * `chunk` and `upload[]` on this request, so a scan is the fallback rather than a
+   * failed upload.
+   */
+  async function mergeChunks(options: {
+    base: string;
+    cid: string | null;
+    nameHints: string[];
+    uploadTarget: string;
+    target: string;
+    uploadPathValues: string[];
+  }): Promise<NextResponse> {
+    const base = safeSegment(options.base);
+    if (!base) {
+      throw new ElfinderError("errInvName");
+    }
+
+    const located = await findChunkStaging(base, options.cid);
+    if (!located) {
+      throw new ElfinderError("errUploadTemp");
+    }
+    const { dir: chunkTempDir, parts } = located;
+
+    const destinationDir = await uploadDestination(
+      options.uploadTarget,
+      options.target,
+      options.uploadPathValues,
+    );
+
+    const realFilename = chooseUploadFilename([
+      options.uploadPathValues[0] ?? "",
+      options.nameHints[0] ?? "",
+      base,
+    ]);
+    const finalName = safeSegment(realFilename);
+    if (!finalName) {
+      throw new ElfinderError("errInvName");
+    }
+
+    const finalAbsolute = path.resolve(destinationDir, finalName);
+    assertWithin(destinationDir, finalAbsolute);
+
+    // Streamed part by part: the parts together are the whole file, so reading them
+    // all into memory would defeat the point of having chunked it.
+    const sink = createWriteStream(finalAbsolute);
+    try {
+      for (const partName of parts) {
+        const source = createReadStream(path.resolve(chunkTempDir, partName));
+        await pipeline(source, sink, { end: false });
+      }
+    } finally {
+      await new Promise<void>((resolve) => sink.end(resolve));
+    }
+
+    await rmWithRetry(chunkTempDir, { recursive: true, force: true }).catch(() => {});
+    return NextResponse.json({ added: [await toFileInfo(relFromAbs(finalAbsolute))] });
+  }
+
+  /** Finds the staging directory holding the parts for `base`, preferring `cid`. */
+  async function findChunkStaging(
+    base: string,
+    cid: string | null,
+  ): Promise<{ dir: string; parts: string[] } | null> {
+    const candidates: string[] = [];
+    const cidSegment = cid ? safeSegment(cid) : null;
+    if (cidSegment) {
+      candidates.push(cidSegment);
+    }
+    for (const name of await fs.readdir(CHUNK_DIR).catch(() => [] as string[])) {
+      if (name !== cidSegment) {
+        candidates.push(name);
+      }
+    }
+
+    for (const name of candidates) {
+      const dir = path.resolve(CHUNK_DIR, name);
+      try {
+        assertWithin(CHUNK_DIR, dir);
+      } catch {
+        continue;
+      }
+      const parts = await chunkPartNamesForBase(dir, base);
+      if (parts.length > 0) {
+        return { dir, parts };
+      }
+    }
+    return null;
+  }
+
+  /** Where an upload's files land, honouring the subdirectory in `upload_path[]`. */
+  async function uploadDestination(
+    uploadTarget: string,
+    target: string,
+    uploadPathValues: string[],
+  ): Promise<string> {
+    if (uploadPathValues.length === 0) {
+      return uploadTarget;
+    }
+    const subdir = normalizeRelativePath(path.posix.dirname(uploadPathValues[0]));
+    if (!subdir) {
+      return uploadTarget;
+    }
+    const resolved = await resolveWithinRoot(target ? `${target}/${subdir}` : subdir);
+    await fs.mkdir(resolved, { recursive: true });
+    return resolved;
+  }
+
   async function handleUpload(formData: FormData) {
     // Awaited rather than fired and forgotten: it is a single directory scan, rate
     // limited to once per interval, and a detached promise would not survive the
@@ -1876,16 +1994,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       uploads.length > 0
     ) {
       const upload = uploads[0];
-      let destinationDir = uploadTarget;
-      if (uploadPathValues.length > 0) {
-        const firstPathDir = normalizeRelativePath(path.posix.dirname(uploadPathValues[0]));
-        if (firstPathDir) {
-          destinationDir = await resolveWithinRoot(
-            target ? `${target}/${firstPathDir}` : firstPathDir,
-          );
-          await fs.mkdir(destinationDir, { recursive: true });
-        }
-      }
+      const destinationDir = await uploadDestination(uploadTarget, target, uploadPathValues);
 
       // `cid` and `chunk` are client-supplied. Neither may widen the path: both
       // are reduced to a single segment and the result is re-checked against
@@ -1930,46 +2039,39 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const isLastChunk = Number.isFinite(total) && bytesOnDisk >= total;
 
       if (!isLastChunk) {
-        const realFilename = chunkName.replace(/\.\d+_\d+\.part$/, "");
-        return NextResponse.json({
-          added: [],
-          _chunkmerged: chunkName,
-          _name: realFilename,
-        });
+        return NextResponse.json({ added: [] });
       }
 
-      const chunkDerivedFilename = chunkName.replace(/\.\d+_\d+\.part$/, "");
+      // All parts have landed, so report completion and stop. The merge happens on the
+      // request the client sends next, carrying these two values back as `chunk` and
+      // `upload[]`. Returning the pair on every intermediate chunk, as this used to,
+      // made the client ask to merge after each slice.
       const pathDerivedFilename = uploadPathValues.length > 0 ? uploadPathValues[0] : "";
-      const uploadDerivedFilename = upload.name || "";
       const realFilename = chooseUploadFilename([
         pathDerivedFilename,
-        uploadDerivedFilename,
-        chunkDerivedFilename,
+        upload.name || "",
+        chunkBaseName(chunkName),
       ]);
-      const parts = await chunkPartNames(chunkTempDir, chunkName);
+      return NextResponse.json({
+        added: [],
+        _chunkmerged: chunkBaseName(chunkName),
+        _name: realFilename,
+      });
+    }
 
-      if (parts.length === 0) {
-        throw new ElfinderError("errUploadTemp");
-      }
-
-      const finalName = safeSegment(realFilename);
-      if (!finalName) {
-        throw new ElfinderError("errInvName");
-      }
-      const finalAbsolute = path.resolve(destinationDir, finalName);
-      assertWithin(destinationDir, finalAbsolute);
-      await fs.rm(finalAbsolute, { force: true });
-      await fs.writeFile(finalAbsolute, Buffer.alloc(0));
-      for (const partName of parts) {
-        const partBuffer = await fs.readFile(path.resolve(chunkTempDir, partName));
-        await fs.appendFile(finalAbsolute, partBuffer);
-      }
-      await Promise.all(
-        parts.map((partName) => fs.rm(path.resolve(chunkTempDir, partName), { force: true })),
-      );
-
-      const finalRelative = relFromAbs(finalAbsolute);
-      return NextResponse.json({ added: [await toFileInfo(finalRelative)] });
+    // Chunk merge request: `chunk` is set but there is no range and no file, because
+    // the client sends the name string it was given rather than another slice.
+    if (typeof chunk === "string" && chunk.length > 0) {
+      return mergeChunks({
+        base: chunk,
+        cid: typeof cid === "string" ? cid : null,
+        nameHints: formData
+          .getAll("upload[]")
+          .filter((value): value is string => typeof value === "string"),
+        uploadTarget,
+        target,
+        uploadPathValues,
+      });
     }
 
     const added: ElfinderFile[] = [];
