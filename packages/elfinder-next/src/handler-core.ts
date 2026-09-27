@@ -30,6 +30,27 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Like `Promise.all(items.map(fn))`, but with at most `limit` calls in flight. */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor++;
+      if (index >= items.length) {
+        return;
+      }
+      results[index] = await fn(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /** Throws unless `absolute` is `root` itself or sits underneath it. */
 function assertWithin(root: string, absolute: string): void {
   if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) {
@@ -362,18 +383,26 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return "upload.bin";
   }
 
-  async function ensureThumbForFile(relativePath: string): Promise<string | null> {
-    const normalized = normalizeRelativePath(relativePath);
-    const hash = encodeHash(normalized);
-    const thumbName = tmbFilenameFromHash(hash);
-    const thumbPath = path.resolve(TMB_DIR, thumbName);
-
+  /** Returns the thumbnail filename if one is already on disk, without creating it. */
+  async function existingThumbForFile(relativePath: string): Promise<string | null> {
+    const thumbName = tmbFilenameFromHash(encodeHash(normalizeRelativePath(relativePath)));
     try {
-      await fs.access(thumbPath);
+      await fs.access(path.resolve(TMB_DIR, thumbName));
       return thumbName;
     } catch {
-      // thumbnail does not exist yet
+      return null;
     }
+  }
+
+  async function ensureThumbForFile(relativePath: string): Promise<string | null> {
+    const normalized = normalizeRelativePath(relativePath);
+    const existing = await existingThumbForFile(normalized);
+    if (existing) {
+      return existing;
+    }
+
+    const thumbName = tmbFilenameFromHash(encodeHash(normalized));
+    const thumbPath = path.resolve(TMB_DIR, thumbName);
 
     try {
       // Read into a buffer so sharp never holds a path-based lock on the source file.
@@ -449,8 +478,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         info.dirs = 1;
       }
     } else if (isImageMime(info.mime)) {
-      const thumb = await ensureThumbForFile(normalized);
-      info.tmb = thumb ?? "1";
+      // "1" means "a thumbnail is possible but not ready", which makes elFinder
+      // fetch it through cmd=tmb in batches. Generating it here instead would run
+      // one sharp resize per image every time a directory is listed, so opening a
+      // folder of 500 images would be 500 resizes inside a single request.
+      info.tmb = (await existingThumbForFile(normalized)) ?? "1";
     }
 
     return info;
@@ -460,17 +492,17 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const baseRelative = normalizeRelativePath(relativeDir);
     const absoluteDir = resolveWithinRoot(baseRelative);
     const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
-    const files = await Promise.all(
-      entries
-        .filter((entry) => entry.name !== ".tmb" && entry.name !== ".chunks")
-        .map(async (entry) => {
-          const childRelative = normalizeRelativePath(
-            baseRelative ? `${baseRelative}/${entry.name}` : entry.name,
-          );
-          return toFileInfo(childRelative);
-        }),
+    const visible = entries.filter(
+      (entry) => entry.name !== ".tmb" && entry.name !== ".chunks",
     );
-    return files;
+    // Bounded rather than Promise.all over the whole directory: each entry costs
+    // at least a stat, and a directory with thousands of files would otherwise
+    // open thousands of descriptors at once.
+    return mapWithConcurrency(visible, 16, (entry) =>
+      toFileInfo(
+        normalizeRelativePath(baseRelative ? `${baseRelative}/${entry.name}` : entry.name),
+      ),
+    );
   }
 
   function getTargets(params: ParamBag): string[] {
@@ -898,9 +930,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
           continue;
         }
         try {
-          const info = await toFileInfo(relative);
-          if (info.tmb && info.tmb !== "1") {
-            images[targetHash] = info.tmb;
+          // Generation happens here, not during directory listing, so this is
+          // the request that pays for it.
+          const thumb = await ensureThumbForFile(relative);
+          if (thumb) {
+            images[targetHash] = thumb;
           }
         } catch {
           // ignore invalid target
