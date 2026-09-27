@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>elFinder picker</title>
+
+    <!--
+      The elFinder client is loaded from cdnjs rather than vendored, so a fresh clone
+      runs without a download step. elFinder derives its asset base (icons, i18n,
+      workers) from this script's URL, so those come from the same CDN directory.
+      Versions follow upstream's main.default.js for 2.1.70.
+    -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.14.2/themes/smoothness/jquery-ui.min.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/elfinder/2.1.70/css/elfinder.min.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/elfinder/2.1.70/css/theme.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/4.0.0/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jqueryui/1.14.2/jquery-ui.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/elfinder/2.1.70/js/elfinder.min.js"></script>
+
+    <style>
+      html, body { margin: 0; height: 100%; }
+    </style>
+  </head>
+  <body>
+    <div id="elfinder"></div>
+
+    <script>
+      $(function () {
+        // Opened by window.open, or embedded in an iframe. Either way the page that
+        // asked for a file is the one to tell.
+        var host = window.opener || (window.parent !== window ? window.parent : null);
+
+        $("#elfinder").elfinder({
+          url: "/api/elfinder",
+          height: "100%",
+          resizable: false,
+          // cdnjs does not carry elFinder's sound files.
+          sound: false,
+          getFileCallback: function (file) {
+            if (!host) {
+              return;
+            }
+            host.postMessage(
+              { type: "elfinder:pick", name: file.name, url: file.url, hash: file.hash },
+              window.location.origin,
+            );
+            if (window.opener) {
+              window.close();
+            }
+          },
+        });
+      });
+    </script>
+  </body>
+</html>
