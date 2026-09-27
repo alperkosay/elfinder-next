@@ -332,7 +332,7 @@ File contents and thumbnails are streamed by the connector itself (`cmd=file`, w
 | `zipdl` | GET/POST | Create ZIP for download workflow |
 | `dim` | GET | Image dimensions, as `WIDTHxHEIGHT` |
 | `upload` | POST | Multipart upload; supports chunked uploads |
-| `resize` | GET/POST | Resize, crop or rotate an image in place (`mode=resize|crop|rotate`); sides are capped at 10000 px |
+| `resize` | GET/POST | Resize, crop or rotate an image in place (`mode` is `resize`, `crop` or `rotate`); sides are capped at 10000 px |
 
 Unknown commands return `{ "error": ["errUnknownCmd"] }`.
 
