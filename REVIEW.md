@@ -23,6 +23,7 @@ Dosya referansları `packages/elfinder-next/src/` altına göredir.
 | 44 | Boş `publicUrl` desteği |
 | 46-49 | Depo düzeni |
 | 51, 52 | vitest sözleşme testleri ve GitHub Actions CI |
+| 60 | Node desteği 20.3+ olarak daraltıldı |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -38,7 +39,7 @@ pnpm typecheck   # kaynak + testler
 
 **Açıkta kalan, bu dilimde kapsam dışı olanlar:** madde 10 (bayat thumbnail),
 11 (öksüz thumbnail), 13 (chunk çöpü), 14 (auth kancaları), 15-19 ve 21-30
-(protokol), 31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen), 60 (Node 18).
+(protokol), 31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen).
 
 ---
 
@@ -433,7 +434,7 @@ Aşağıdakiler `git ls-files` ile doğrulandı.
 - [ ] **58. Peer aralığı doğrulanmamış.** `peerDependencies` `next >= 14` diyor ama hem devDependency hem playground `16.2.6` kullanıyor. 14 ve 15 hiç denenmemiş. Ya CI'a matris ekle ya aralığı daralt.
 - [ ] **59.** CJS build eklemeyi düşün (`format: ["esm", "cjs"]`), `sideEffects: false` ekle.
 
-### 60. Node 18 desteği iddiası muhtemelen yanlış
+### 60. Node desteği iddiası yanlıştı — YAPILDI
 
 Test paketini kurarken çıktı, ilk iki turda yoktu.
 
@@ -443,16 +444,19 @@ Test paketini kurarken çıktı, ilk iki turda yoktu.
 formData.getAll("upload[]").filter((f): f is File => f instanceof File)
 ```
 
-`File` globali Node 20'de geldi. Node 18'de `node:buffer` üzerinden erişilebiliyor
-ama global değil, yani orada bu satır istek anında `ReferenceError` atar. README
-ise "Node.js 18+ (20+ recommended)" diyor.
+`File` globali Node 20'de geldi, Node 18'de yalnızca `node:buffer` üzerinden
+erişilebiliyor. Yani o satır Node 18'de istek anında `ReferenceError` atar.
+İkinci kısıt `sharp`'tan geliyor: `^18.17.0 || ^20.3.0 || >=21.0.0`. İki kısıtın
+kesişimi **20.3** oluyor, düz 18.0-18.16 ise zaten hiç desteklenmiyordu.
 
-Buradaki Node 26 olduğu için doğrudan test edilemedi. CI'a bunu cevaplatmak üzere
-`node18` işi eklendi, `continue-on-error: true` ile bloke etmiyor.
+Karar: iddia daraltıldı, globalden vazgeçilmedi.
 
-- [ ] CI'daki `node18` işinin sonucuna bak
-- [ ] Başarısızsa ya iddiayı Node 20+'a çek ya `File` globalinden vazgeç
-- [ ] `package.json` içine `engines` alanı ekle (madde 51 ile birlikte)
+- [x] `engines: { node: ">=20.3.0" }` eklendi
+- [x] Her iki README'de Node 20.3+ olarak düzeltildi, sebebi de yazıldı
+- [x] CI matrisi tabanı gerçekten test ediyor (`20.3` ve `22`)
+- [x] Bloke etmeyen `node18` işi kaldırıldı, sorusu cevaplandı
+
+Not: madde 54'teki `repository`, `homepage` ve `bugs` alanları hâlâ eksik.
 
 ---
 

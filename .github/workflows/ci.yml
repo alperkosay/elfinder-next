@@ -18,7 +18,10 @@ jobs:
         # case-insensitive-but-not-Windows filesystem, which the case-only rename
         # test depends on.
         os: [ubuntu-latest, windows-latest, macos-latest]
-        node: [20, 22]
+        # 20.3 is the floor declared in engines, so test it rather than whatever
+        # the latest 20.x happens to be; 22 covers a current release. The floor is
+        # where `File` became global and where sharp's supported range begins.
+        node: ["20.3", "22"]
 
     steps:
       - uses: actions/checkout@v4
@@ -37,21 +40,3 @@ jobs:
         # Catches what the unit tests cannot: that the built package still
         # type-checks and bundles inside a real Next.js app.
         run: pnpm --filter playground build
-
-  node18:
-    name: node 18 (verifies the README's support claim)
-    runs-on: ubuntu-latest
-    # Non-blocking on purpose. The README says Node 18+, but handler-core.ts
-    # relies on a global `File`, which only became global in Node 20. This job
-    # exists to answer that question rather than leave it asserted. If it fails,
-    # either narrow the claim to Node 20+ or stop depending on the global.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 18
-          cache: pnpm
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm test

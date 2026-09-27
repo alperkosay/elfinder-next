@@ -38,11 +38,15 @@ The package is **backend-only**. It does not bundle the elFinder UI.
 
 ## Requirements
 
-- **Node.js** 18+ (20+ recommended)
+- **Node.js** 20.3 or later
 - **Next.js** 14 or later (App Router, `route.ts` handlers)
 - **Runtime:** Node.js (`export const runtime = "nodejs"` is included in the handler exports)
 
 Bundled dependencies: `sharp`, `adm-zip`, `mime-types`.
+
+The Node floor is not arbitrary, so please do not lower it: upload handling tests
+`instanceof File`, and `File` only became a global in Node 20, while `sharp`
+declares `^18.17.0 || ^20.3.0 || >=21.0.0`. The overlap starts at 20.3.
 
 ---
 

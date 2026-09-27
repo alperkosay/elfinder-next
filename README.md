@@ -62,7 +62,7 @@ Full installation steps, configuration table, security notes, and command refere
 
 ## Quick start (contributors)
 
-**Prerequisites:** Node.js 18+, [pnpm](https://pnpm.io/) 10+
+**Prerequisites:** Node.js 20.3+, [pnpm](https://pnpm.io/) 10+
 
 ```bash
 git clone <repository-url>
