@@ -5,6 +5,7 @@ import mime from "mime-types";
 import AdmZip from "adm-zip";
 import sharp from "sharp";
 import type { ElfinderContext } from "./context.js";
+import { ElfinderError, toErrorResponse } from "./errors.js";
 import type { ElfinderFile, ElfinderHandlers } from "./types.js";
 
 // libvips keeps input file handles in its cache; on Windows that blocks unlink (EBUSY).
@@ -118,7 +119,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const absolute = path.resolve(UPLOAD_DIR, safeRelative);
     const rootPrefix = `${UPLOAD_DIR}${path.sep}`;
     if (absolute !== UPLOAD_DIR && !absolute.startsWith(rootPrefix)) {
-      throw new Error("Access denied");
+      throw new ElfinderError("errAccess");
     }
     return absolute;
   }
@@ -405,7 +406,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const target = decodeHash(params.get("target"));
     const name = (params.get("name") || "New Folder").trim();
     if (!name) {
-      throw new Error("Folder name is required");
+      throw new ElfinderError("errInvName");
     }
     const targetRelative = normalizeRelativePath(target ? `${target}/${name}` : name);
     const absolute = resolveWithinRoot(targetRelative);
@@ -438,12 +439,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const targetHash = params.get("target");
     const name = (params.get("name") || "").trim();
     if (!targetHash || !name) {
-      throw new Error("Missing rename arguments");
+      throw new ElfinderError("errInvName");
     }
 
     const oldRelative = decodeHash(targetHash);
     if (!oldRelative) {
-      throw new Error("Root folder cannot be renamed");
+      throw new ElfinderError("errPerm");
     }
 
     const parent = normalizeRelativePath(path.posix.dirname(oldRelative));
@@ -459,13 +460,13 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handleFile(params: ParamBag) {
     const target = decodeHash(params.get("target"));
     if (!target) {
-      return NextResponse.json({ error: "Invalid target" }, { status: 400 });
+      throw new ElfinderError("errFileNotFound");
     }
 
     const absolute = resolveWithinRoot(target);
     const stat = await fs.stat(absolute);
     if (!stat.isFile()) {
-      return NextResponse.json({ error: "Target is not a file" }, { status: 400 });
+      throw new ElfinderError("errNotFile");
     }
 
     const data = await fs.readFile(absolute);
@@ -499,7 +500,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handleGet(params: ParamBag) {
     const target = decodeHash(params.get("target"));
     if (!target) {
-      throw new Error("Invalid target");
+      throw new ElfinderError("errFileNotFound");
     }
     const content = await fs.readFile(resolveWithinRoot(target), "utf8");
     return NextResponse.json({ content });
@@ -508,7 +509,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handlePut(params: ParamBag) {
     const target = decodeHash(params.get("target"));
     if (!target) {
-      throw new Error("Invalid target");
+      throw new ElfinderError("errFileNotFound");
     }
     const content = params.get("content") ?? "";
     await fs.writeFile(resolveWithinRoot(target), content, "utf8");
@@ -692,7 +693,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handleExtract(params: ParamBag) {
     const target = decodeHash(params.get("target"));
     if (!target) {
-      throw new Error("Invalid target");
+      throw new ElfinderError("errFileNotFound");
     }
     const makedir = isTruthy(params.get("makedir"));
     const zipAbs = resolveWithinRoot(target);
@@ -721,7 +722,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handleZipdl(params: ParamBag) {
     const targets = getTargets(params);
     if (targets.length === 0) {
-      throw new Error("No targets");
+      throw new ElfinderError("errCmdParams");
     }
     const first = decodeHash(targets[0]);
     const parent = normalizeRelativePath(path.posix.dirname(first));
@@ -755,10 +756,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleResize(params: ParamBag) {
     void params;
-    return NextResponse.json(
-      { error: "Resize is not supported in this backend" },
-      { status: 400 },
-    );
+    return NextResponse.json({ error: ["errCmdNoSupport"] });
   }
 
   function toParamBagFromSearchParams(params: URLSearchParams): ParamBag {
@@ -826,10 +824,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       case "resize":
         return handleResize(params);
       default:
-        return NextResponse.json(
-          { error: `Command not implemented: ${cmd ?? "none"}` },
-          { status: 400 },
-        );
+        return NextResponse.json({ error: ["errUnknownCmd"] });
     }
   }
 
@@ -918,10 +913,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         });
 
       if (parts.length === 0) {
-        return NextResponse.json(
-          { error: "No chunk parts found for merge" },
-          { status: 400 },
-        );
+        throw new ElfinderError("errUploadTemp");
       }
 
       const finalAbsolute = path.resolve(destinationDir, path.posix.basename(realFilename));
@@ -967,9 +959,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const params = req.nextUrl.searchParams;
       return await executeCommand(params.get("cmd"), toParamBagFromSearchParams(params));
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unexpected backend error";
-      const status = message === "Access denied" ? 403 : 500;
-      return NextResponse.json({ error: message }, { status });
+      return toErrorResponse(error);
     }
   }
 
@@ -1000,9 +990,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       }
       return await executeCommand(cmd, toParamBagFromSearchParams(params));
     } catch (error) {
-      const message = error instanceof Error ? error.message : "Unexpected backend error";
-      const status = message === "Access denied" ? 403 : 500;
-      return NextResponse.json({ error: message }, { status });
+      return toErrorResponse(error);
     }
   }
 
