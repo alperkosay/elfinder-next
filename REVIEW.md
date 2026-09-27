@@ -45,7 +45,7 @@ pnpm typecheck   # kaynak + testler
 ```
 
 **Açıkta kalan:** madde 32, 33 (mimari), 34-37, 39-41 (küçük düzeltmeler), 61
-(izleme uyarısı).
+(izleme uyarısının kozmetik kalanı, 32 ile birlikte).
 
 Sıradaki bloklar: madde 61 ve küçük düzeltmeler (34-37, 39-41, 35 ile birlikte `sideEffects`),
 ve en büyük iş olarak StorageAdapter soyutlaması (32).
@@ -497,7 +497,7 @@ Not: madde 54'teki `repository`, `homepage` ve `bugs` alanları `chore/repo-hygi
 
 ---
 
-### 61. Turbopack tüm projeyi izliyor
+### 61. Turbopack tüm projeyi izliyor — ÖLÇÜLDÜ, yalnızca workspace bağlantısında, önlem belgelendi
 
 Madde 45 doğrulanırken çıktı, bu daldan önce de vardı (`4ee2328` üzerinde aynı uyarı).
 `next build` şunu raporluyor:
@@ -508,17 +508,29 @@ A file was traced that indicates that the whole project was traced unintentional
 Import trace: next.config.ts -> packages/elfinder-next/dist/index.js -> app/api/elfinder/route.ts
 ```
 
-Sebep `context.ts` içindeki `process.cwd()` tabanlı varsayılan yol. Turbopack bu yolun
-nereye çıkacağını bilemediği için projenin tamamını route'un bağımlılığı sayıyor. Build
-bozulmuyor ama standalone çıktısı gereksiz şişiyor ve her kullanıcı bu uyarıyı görecek.
+**İlk hipotez yanlıştı.** Sebep `process.cwd()` değil: `dist`ten `process.cwd()`
+tamamen çıkarıldığında da uyarı sürüyor. `/*turbopackIgnore: true*/` yorumu tsup
+çıktısında korunuyor, ama yalnızca `cwd`, yalnızca `path` çağrıları ya da yalnızca `fs`
+çağrıları işaretlendiğinde uyarı kaybolmuyor. Ancak bundle'daki 114 `fs`/`path`
+çağrısının hepsi işaretlenince kayboluyor. Yani birbirinden bağımsız birden çok
+tetikleyici var.
 
-Önerilen çözüm `path.join(/*turbopackIgnore: true*/ process.cwd(), ...)`. Ancak
-tsup (esbuild) sıradan yorumları çıktıdan siliyor, yani yorumun `dist`'te kaldığı
-doğrulanmalı. İzleme statik analiz olduğu için çağrıyı ilk isteğe ertelemek sonucu
-değiştirmez.
+**Etki beklenenden ciddi, ama dar:**
 
-- [ ] Yorumun `dist/index.js` içinde korunup korunmadığını kontrol et
-- [ ] Uyarının playground build'inde kaybolduğunu doğrula
+- Workspace bağlantısıyla (playground'daki gibi) build sırasında `apps/playground/uploads/`
+  altında duran dosyalar, `private/salary.xlsx` dahil, route'un `.nft.json` listesine
+  girdi. Standalone build'de bunlar `.next/standalone`'a, yani Docker imajına kopyalanır.
+- Tarball'dan `node_modules`'a kurulan temiz bir Next 16.2.6 uygulamasında uyarı yok,
+  `uploads/` izlenmiyor, `node_modules` dışındaki 5 dosyanın hepsi build chunk'ı.
+  npm kullanıcıları etkilenmiyor.
+- Paketi `serverExternalPackages`'a eklemek workspace bağlantısında işe yaramıyor.
+
+Karar: 114 yere yorum eklenmedi. Kırılgan olur ve npm kullanıcılarında sorun yok.
+
+- [x] Yorumun `dist/index.js` içinde korunup korunmadığını kontrol et (korunuyor, ama yetmiyor)
+- [x] `outputFileTracingExcludes: { "/api/elfinder": ["./uploads/**/*"] }` ile `uploads/` izlemeden çıkıyor, doğrulandı
+- [x] Playground'a bu ayar eklendi, README'nin standalone bölümüne uyarı ve ayar yazıldı
+- [ ] Uyarı metni playground build'inde hâlâ çıkıyor (kozmetik). Kalıcı çözüm dinamik yolları tek bir modülde toplamak olabilir, madde 32 (StorageAdapter) ile birlikte ele alınmalı.
 
 ### Kırılganlık notu — YAPILDI, README artık düz değerleri gösteriyor
 

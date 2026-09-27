@@ -6,6 +6,7 @@ const nextConfig: NextConfig = {
   // elfinder-next lives in packages/, outside this app. Without the repository root
   // as the tracing root, a standalone build leaves it and sharp's binary behind.
   outputFileTracingRoot: path.join(__dirname, "../../"),
+  outputFileTracingExcludes: { "/api/elfinder": ["./uploads/**/*"] },
 };
 
 export default nextConfig;

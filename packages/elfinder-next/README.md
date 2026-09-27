@@ -208,6 +208,18 @@ Three things go wrong with the defaults:
 3. **`public/` is not copied** into the standalone output. This no longer matters
    for uploads, but applies to your own static files as usual.
 
+**If the package is linked from source** (a workspace dependency in a monorepo,
+rather than installed from npm), Next bundles it and its file-tracer gives up on the
+many dynamic paths: `next build` warns that "the whole project was traced", and
+**anything under the app directory at build time is copied into the standalone
+output — including an `uploads/` folder full of user files.** Installing from npm is
+not affected; this was measured on Next 16.2.6 in both setups. Keep `uploadDir`
+outside the project, and exclude it from tracing if it must live there:
+
+```ts
+outputFileTracingExcludes: { "/api/elfinder": ["./uploads/**/*"] },
+```
+
 ```ts
 // next.config.ts
 import path from "node:path";
