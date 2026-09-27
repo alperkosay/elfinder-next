@@ -26,6 +26,7 @@ Tamamlanan maddeler (`fix/security-and-core-hardening` ve `fix/thumbnail-lifecyc
 | 60 | Node desteği 20.3+ olarak daraltıldı |
 | 10, 11, 13 | Thumbnail parmak izi, temizlik ve chunk toplayıcı |
 | 14 | Auth ve yol başına izin kancaları |
+| 15-19, 21-30 | Protokol uyumu (zipdl iki faz, chunk birleştirme, boyut, arama, options) |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -35,15 +36,15 @@ oluyor.
 Komutlar:
 
 ```bash
-pnpm test        # vitest, 146 test
+pnpm test        # vitest, 188 test
 pnpm typecheck   # kaynak + testler
 ```
 
-**Açıkta kalan:** madde 15-19 ve 21-30 (protokol),
-31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen ve npm metadata).
+**Açıkta kalan:** madde 31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen ve npm
+metadata), 34-41 (küçük düzeltmeler).
 
-Sıradaki en büyük blok protokol uyumu (15-19, 21-30): on altı madde, çoğu beş ila
-yirmi satır.
+Sıradaki bloklar: dağıtım belgeleri (42, 43, 45), depo hijyeni ve npm metadata
+(50, 53-59), ve en büyük iş olarak StorageAdapter soyutlaması (32).
 
 ---
 
