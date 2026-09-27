@@ -24,11 +24,15 @@ export type ElfinderContext = {
   rootHash: string;
   tmbDir: string;
   chunkDir: string;
+  tmpDir: string;
   publicUrl: string;
   tmbUrl: string;
   maxArchiveEntries: number;
   maxArchiveBytes: number;
   chunkTtlMs: number;
+  maxUploadBytes: number;
+  maxUploadFiles: number;
+  maxSearchResults: number;
   authorize: AuthorizeFn | null;
   permissions: PermissionsFn | null;
 };
@@ -65,11 +69,15 @@ export function resolveContext<Session>(
     rootHash: `${volumeId}Lw`,
     tmbDir: path.resolve(uploadDir, ".tmb"),
     chunkDir: path.resolve(uploadDir, ".chunks"),
+    tmpDir: path.resolve(uploadDir, ".tmp"),
     publicUrl: normalizeUrlPrefix(publicUrl),
     tmbUrl: normalizeUrlPrefix(tmbUrl),
     maxArchiveEntries: options.maxArchiveEntries ?? 10_000,
     maxArchiveBytes: options.maxArchiveBytes ?? 1024 * 1024 * 1024,
     chunkTtlMs: options.chunkTtlMs ?? 24 * 60 * 60 * 1000,
+    maxUploadBytes: options.maxUploadBytes ?? 256 * 1024 * 1024,
+    maxUploadFiles: options.maxUploadFiles ?? 20,
+    maxSearchResults: options.maxSearchResults ?? 500,
     authorize: (options.authorize as AuthorizeFn | undefined) ?? null,
     permissions: (options.permissions as PermissionsFn | undefined) ?? null,
   };

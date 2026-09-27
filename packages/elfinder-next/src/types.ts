@@ -73,6 +73,25 @@ export type ElfinderOptions<Session = unknown> = {
    */
   chunkTtlMs?: number;
   /**
+   * Largest single upload, in bytes. Reported to elFinder as `uplMaxSize` so the
+   * client can refuse an oversized file before sending it, and enforced on arrival
+   * so a client that ignores it cannot fill the disk. `0` removes the limit.
+   * Default: 256 MiB
+   */
+  maxUploadBytes?: number;
+  /**
+   * Most files elFinder should put in one upload request, reported as `uplMaxFile`.
+   * The client batches larger selections rather than failing. `0` removes the limit.
+   * Default: `20`
+   */
+  maxUploadFiles?: number;
+  /**
+   * Most matches `search` will return before it stops walking. Keeps a search over a
+   * large volume from becoming a slow request with an unrenderable response.
+   * Default: `500`
+   */
+  maxSearchResults?: number;
+  /**
    * Decides whether a request may reach the connector at all, and returns whatever
    * the `permissions` callback needs to know about the caller.
    *
