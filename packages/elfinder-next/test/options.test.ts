@@ -1,7 +1,9 @@
+import fs from "node:fs/promises";
 import path from "node:path";
+import sharp from "sharp";
 import { describe, expect, it } from "vitest";
 import { resolveContext } from "../src/context.js";
-import { ROOT_HASH, json, makeVolume } from "./helpers.js";
+import { ROOT_HASH, hashOf, json, makeVolume } from "./helpers.js";
 
 /** The root volume options elFinder reads on init. */
 async function rootOptions(options = {}) {
@@ -100,6 +102,29 @@ describe("uploadDir resolution", () => {
     await vol.GET(`cmd=open&init=1&target=${ROOT_HASH}`);
     expect(await vol.exists(".tmb")).toBe(true);
     expect(await vol.exists(".chunks")).toBe(true);
+  });
+
+  it("creates them once, not on every request (item 36)", async () => {
+    const vol = await makeVolume();
+    await vol.GET(`cmd=open&init=1&target=${ROOT_HASH}`);
+    await fs.rm(vol.at(".chunks"), { recursive: true });
+
+    await vol.GET(`cmd=open&target=${ROOT_HASH}`);
+    expect(await vol.exists(".chunks")).toBe(false);
+  });
+
+  it("still writes a thumbnail after .tmb disappears", async () => {
+    const png = await sharp({
+      create: { width: 60, height: 40, channels: 3, background: "#08c" },
+    })
+      .png()
+      .toBuffer();
+    const vol = await makeVolume({ "a.png": png });
+    await vol.GET(`cmd=open&init=1&target=${ROOT_HASH}`);
+    await fs.rm(vol.at(".tmb"), { recursive: true });
+
+    const body = await json(await vol.GET(`cmd=tmb&targets[]=${hashOf("a.png")}`));
+    expect(Object.keys(body.images)).toHaveLength(1);
   });
 });
 

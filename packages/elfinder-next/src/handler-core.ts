@@ -610,11 +610,24 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     );
   }
 
-  async function ensureUploadDir(): Promise<void> {
-    await fs.mkdir(UPLOAD_DIR, { recursive: true });
-    await fs.mkdir(TMB_DIR, { recursive: true });
-    await fs.mkdir(CHUNK_DIR, { recursive: true });
-    await fs.mkdir(TMP_DIR, { recursive: true });
+  let uploadDirReady: Promise<void> | null = null;
+
+  /**
+   * Creates the volume and its bookkeeping directories once per handler, rather
+   * than issuing four mkdir calls on every request. A failure is not cached, so a
+   * volume that was briefly unavailable (an unmounted disk, say) is retried.
+   */
+  function ensureUploadDir(): Promise<void> {
+    uploadDirReady ??= (async () => {
+      await fs.mkdir(UPLOAD_DIR, { recursive: true });
+      await Promise.all(
+        [TMB_DIR, CHUNK_DIR, TMP_DIR].map((dir) => fs.mkdir(dir, { recursive: true })),
+      );
+    })().catch((error) => {
+      uploadDirReady = null;
+      throw error;
+    });
+    return uploadDirReady;
   }
 
   function isImageMime(mimeType: string): boolean {
@@ -656,15 +669,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   function detectMimeFromName(name: string): string {
-    const byLookup = mime.lookup(name);
-    if (byLookup) {
-      return byLookup;
-    }
-    const ext = path.posix.extname(name).toLowerCase();
-    if (ext === ".pdf") {
-      return "application/pdf";
-    }
-    return "application/octet-stream";
+    return mime.lookup(name) || "application/octet-stream";
   }
 
   /**
@@ -738,6 +743,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     try {
       // Read into a buffer so sharp never holds a path-based lock on the source file.
       const input = await fs.readFile(absolute);
+      // ensureUploadDir runs once per handler, so .tmb may have been removed since.
+      await fs.mkdir(TMB_DIR, { recursive: true });
       await sharp(input)
         .resize(48, 48, { fit: "inside", withoutEnlargement: true })
         .png()
