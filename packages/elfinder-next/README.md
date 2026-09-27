@@ -41,7 +41,7 @@ The package is **backend-only**. It does not bundle the elFinder UI.
 
 - **Node.js** 20.3 or later
 - **Next.js** 14 or later (App Router, `route.ts` handlers)
-- **Runtime:** Node.js (`export const runtime = "nodejs"` is included in the handler exports)
+- **Runtime:** Node.js (`export const runtime = "nodejs"` in the route file)
 
 Bundled dependencies: `sharp`, `adm-zip`, `mime-types`.
 
@@ -75,6 +75,10 @@ const nextConfig: NextConfig = {
 
 export default nextConfig;
 ```
+
+On Next 14 the key is `experimental.serverComponentsExternalPackages`; 14 warns
+about and ignores `serverExternalPackages`. `sharp` is on 14's built-in list
+either way, and the connector builds and runs on 14.2 without the setting.
 
 ---
 
@@ -434,7 +438,7 @@ npm publish
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
 
 ---
 
@@ -442,4 +446,4 @@ MIT
 
 - [elFinder project](https://github.com/Studio-42/elFinder)
 - [elFinder 2.1 client API](https://github.com/Studio-42/elFinder/wiki/Client-configuration-options)
-- [Repository monorepo](https://github.com/your-org/elfinder-next) — replace with your Git URL when published
+- [Source repository](https://github.com/alperkosay/elfinder-next)
