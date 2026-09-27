@@ -22,10 +22,12 @@ Dosya referansları `packages/elfinder-next/src/` altına göredir.
 | 12 | Akış ve HTTP Range (yalnızca indirme tarafı) |
 | 44 | Boş `publicUrl` desteği |
 | 46-49 | Depo düzeni |
+| 51, 52 | vitest sözleşme testleri ve GitHub Actions CI |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
-doğrulandı. Sekiz doğrulama betiği scratchpad'de, depoya girmedi. Kalıcı test
-paketi madde 51 olarak hâlâ açık.
+doğrulandı. Geçici betikler artık  altında kalıcı
+vitest paketine dönüştü: 99 test, orijinal kaynağa karşı koşturulduğunda 44'ü
+başarısız oluyor.
 
 **Açıkta kalan, bu dilimde kapsam dışı olanlar:** madde 10 (bayat thumbnail),
 11 (öksüz thumbnail), 13 (chunk çöpü), 14 (auth kancaları), 15-19 ve 21-30
@@ -414,8 +416,8 @@ Aşağıdakiler `git ls-files` ile doğrulandı.
 - [x] **48. Build artefaktı commit'lenmiş.** `apps/playground/tsconfig.tsbuildinfo` gitignore'a girmeli.
 - [x] **49. Playground kırık.** `app/page.tsx` butonu `/elfinder-static/picker.html`, iframe'i `/elfinder/picker.html` açıyor. İkisi farklı, biri kesinlikle 404.
 - [ ] **50. Temiz klone playground çalışmıyor.** `.gitignore` içinde `apps/playground/public/elfinder` var, yani elFinder arayüz dosyaları depoda yok ve onları getiren bir adım veya script de yok. README "playground'u çalıştır" diyor ama çalışmıyor.
-- [ ] **51. Test yok.** Bir protokol connector'ı tam olarak sözleşme testi gerektiren şey. Geçici dizin ve fixture istekleriyle vitest kurmak bir günlük iş, yukarıdaki hataların çoğunu regresyona karşı kilitler.
-- [ ] **52. CI yok.** Build, test ve lint için bir workflow ekle.
+- [x] **51. Test yok.** — YAPILDI, 99 test 7 dosyada. Bir protokol connector'ı tam olarak sözleşme testi gerektiren şey. Geçici dizin ve fixture istekleriyle vitest kurmak bir günlük iş, yukarıdaki hataların çoğunu regresyona karşı kilitler.
+- [x] **52. CI yok.** — YAPILDI, 3 OS x Node 20/22 artı bloke etmeyen Node 18 işi. Build, test ve lint için bir workflow ekle.
 - [ ] **53. `LICENSE` dosyası yok.** README'deki rozet var olmayan bir dosyaya bağlanıyor.
 - [ ] **54.** `package.json` içinde `repository`, `homepage`, `bugs` ve `engines` alanları eksik. npm sayfasında kaynak bağlantısı görünmeyecek.
 - [ ] **55.** `files` dizisi `LICENSE`'ı da içermeli.
@@ -423,6 +425,29 @@ Aşağıdakiler `git ls-files` ile doğrulandı.
 - [ ] **57.** Root README'deki `https://github.com/your-org/elfinder-next` placeholder'ını gerçek URL ile değiştir.
 - [ ] **58. Peer aralığı doğrulanmamış.** `peerDependencies` `next >= 14` diyor ama hem devDependency hem playground `16.2.6` kullanıyor. 14 ve 15 hiç denenmemiş. Ya CI'a matris ekle ya aralığı daralt.
 - [ ] **59.** CJS build eklemeyi düşün (`format: ["esm", "cjs"]`), `sideEffects: false` ekle.
+
+### 60. Node 18 desteği iddiası muhtemelen yanlış
+
+Test paketini kurarken çıktı, ilk iki turda yoktu.
+
+`handler-core.ts:1216` yüklenen dosyaları süzmek için global `File` kullanıyor:
+
+```ts
+formData.getAll("upload[]").filter((f): f is File => f instanceof File)
+```
+
+`File` globali Node 20'de geldi. Node 18'de `node:buffer` üzerinden erişilebiliyor
+ama global değil, yani orada bu satır istek anında `ReferenceError` atar. README
+ise "Node.js 18+ (20+ recommended)" diyor.
+
+Buradaki Node 26 olduğu için doğrudan test edilemedi. CI'a bunu cevaplatmak üzere
+`node18` işi eklendi, `continue-on-error: true` ile bloke etmiyor.
+
+- [ ] CI'daki `node18` işinin sonucuna bak
+- [ ] Başarısızsa ya iddiayı Node 20+'a çek ya `File` globalinden vazgeç
+- [ ] `package.json` içine `engines` alanı ekle (madde 51 ile birlikte)
+
+---
 
 ### Kırılganlık notu
 

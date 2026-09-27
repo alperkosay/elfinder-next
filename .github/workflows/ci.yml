@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The connector does a lot of path handling, and more than one bug it has
+        # already hit was Windows-only: backslashes are not separators to
+        # path.posix, and NTFS forbids characters POSIX allows. macOS covers the
+        # case-insensitive-but-not-Windows filesystem, which the case-only rename
+        # test depends on.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: [20, 22]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+      - name: Build playground
+        # Catches what the unit tests cannot: that the built package still
+        # type-checks and bundles inside a real Next.js app.
+        run: pnpm --filter playground build
+
+  node18:
+    name: node 18 (verifies the README's support claim)
+    runs-on: ubuntu-latest
+    # Non-blocking on purpose. The README says Node 18+, but handler-core.ts
+    # relies on a global `File`, which only became global in Node 20. This job
+    # exists to answer that question rather than leave it asserted. If it fails,
+    # either narrow the claim to Node 20+ or stop depending on the global.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
