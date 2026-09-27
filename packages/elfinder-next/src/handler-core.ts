@@ -102,6 +102,23 @@ function safeSegment(raw: string): string | null {
   return cleaned;
 }
 
+/**
+ * Validates a name the client chose for a new or renamed entry.
+ *
+ * Unlike safeSegment, which salvages a usable name from upload metadata, this
+ * refuses. A typed name containing a separator or `..` would be joined onto the
+ * target and normalized into a different directory — one whose permissions were
+ * never checked — and quietly trimming it would create an entry nobody named.
+ */
+function requireEntryName(raw: string | null, fallback = ""): string {
+  const name = (raw || fallback).trim();
+  // eslint-disable-next-line no-control-regex
+  if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/.test(name)) {
+    throw new ElfinderError("errInvName");
+  }
+  return name;
+}
+
 async function rmWithRetry(
   absolutePath: string,
   options?: { recursive?: boolean; force?: boolean },
@@ -1142,10 +1159,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleMkdir(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
-    const name = (params.get("name") || "New Folder").trim();
-    if (!name) {
-      throw new ElfinderError("errInvName");
-    }
+    const name = requireEntryName(params.get("name"), "New Folder");
     await requireWrite(target);
     const targetRelative = normalizeRelativePath(target ? `${target}/${name}` : name);
     const absolute = await resolveWithinRoot(targetRelative);
@@ -1180,10 +1194,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleRename(params: ParamBag) {
     const targetHash = params.get("target");
-    const name = (params.get("name") || "").trim();
-    if (!targetHash || !name) {
+    if (!targetHash) {
       throw new ElfinderError("errInvName");
     }
+    const name = requireEntryName(params.get("name"));
 
     const oldRelative = decodeHash(targetHash);
     if (!oldRelative) {
@@ -1316,10 +1330,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleMkfile(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
-    const name = (params.get("name") || "newfile.txt").trim();
+    const name = requireEntryName(params.get("name"), "newfile.txt");
     await requireWrite(target);
     const relative = normalizeRelativePath(target ? `${target}/${name}` : name);
-    await fs.writeFile(await resolveWithinRoot(relative), "");
+    // "wx": an existing file of the same name answers errExists rather than being
+    // truncated to zero bytes.
+    await fs.writeFile(await resolveWithinRoot(relative), "", { flag: "wx" });
     return NextResponse.json({ added: [await toFileInfo(relative)] });
   }
 
@@ -1606,9 +1622,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleArchive(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
-    const name = (params.get("name") || "archive.zip").trim();
+    const name = requireEntryName(params.get("name"), "archive.zip");
     const archiveRel = normalizeRelativePath(target ? `${target}/${name}` : name);
     await requireWrite(target);
+    const archiveAbs = await resolveWithinRoot(archiveRel);
+    // writeZip replaces whatever is there, so check before collecting anything.
+    await assertNotOccupied(archiveAbs);
     const zip = new (AdmZip as unknown as new () => ZipAdapter)();
     for (const targetHash of getTargets(params)) {
       const rel = decodeHash(targetHash);
@@ -1619,7 +1638,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const abs = await resolveWithinRoot(rel);
       await addPathToZip(zip, abs, path.posix.basename(rel));
     }
-    zip.writeZip(await resolveWithinRoot(archiveRel));
+    zip.writeZip(archiveAbs);
     return NextResponse.json({ added: [await toFileInfo(archiveRel)] });
   }
 
