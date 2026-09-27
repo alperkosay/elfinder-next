@@ -330,9 +330,9 @@ File contents and thumbnails are streamed by the connector itself (`cmd=file`, w
 | `archive` | GET/POST | ZIP selected items into archive |
 | `extract` | GET/POST | Extract ZIP |
 | `zipdl` | GET/POST | Create ZIP for download workflow |
-| `dim` | GET | Returns `unknown` (placeholder) |
+| `dim` | GET | Image dimensions, as `WIDTHxHEIGHT` |
 | `upload` | POST | Multipart upload; supports chunked uploads |
-| `resize` | — | **Not implemented** (returns `errCmdNoSupport`) |
+| `resize` | GET/POST | Resize, crop or rotate an image in place (`mode=resize|crop|rotate`); sides are capped at 10000 px |
 
 Unknown commands return `{ "error": ["errUnknownCmd"] }`.
 
@@ -419,7 +419,6 @@ The one exception is a request refused by `authorize`, which answers **HTTP 403*
 ## Limitations
 
 - Single local volume per handler instance
-- No `resize` command
 - No cloud storage backends (S3, etc.), so no serverless deployment
 - Archivers limited to ZIP via `adm-zip`
 - `chmod` and `netmount` are disabled

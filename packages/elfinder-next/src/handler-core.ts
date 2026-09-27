@@ -1869,14 +1869,113 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }, 30_000).unref?.();
   }
 
-  async function handleDim(params: ParamBag) {
-    void params;
-    return NextResponse.json({ dim: "unknown" });
+  /** Reads an image file into a buffer, refusing anything that is not a file. */
+  async function readImageSource(target: string): Promise<{ absolute: string; input: Buffer }> {
+    const absolute = await resolveWithinRoot(target);
+    if (!(await fs.stat(absolute)).isFile()) {
+      throw new ElfinderError("errNotFile");
+    }
+    // A buffer rather than a path, as for thumbnails, so libvips never holds the
+    // file open and blocks a later unlink on Windows.
+    return { absolute, input: await fs.readFile(absolute) };
   }
 
+  async function handleDim(params: ParamBag) {
+    const target = decodeHash(params.get("target"));
+    if (!target) {
+      throw new ElfinderError("errFileNotFound");
+    }
+    await requireRead(target);
+    const { input } = await readImageSource(target);
+
+    let width: number | undefined;
+    let height: number | undefined;
+    try {
+      ({ width, height } = await sharp(input).metadata());
+    } catch {
+      // Not an image sharp can read.
+    }
+    if (!width || !height) {
+      throw new ElfinderError("errUsupportType");
+    }
+    return NextResponse.json({ dim: `${width}x${height}` });
+  }
+
+  /** Largest side resize and crop accept, so one request cannot allocate gigapixels. */
+  const MAX_EDIT_SIDE = 10_000;
+
+  /**
+   * Resizes, crops or rotates an image in place, as the client's resize dialog asks.
+   *
+   * The client computes the final box itself, keeping the aspect ratio if the user
+   * asked it to, so `resize` fills exactly width x height. The format is kept, and
+   * the result replaces the file only once it has been fully written.
+   */
   async function handleResize(params: ParamBag) {
-    void params;
-    return NextResponse.json({ error: ["errCmdNoSupport"] });
+    const target = decodeHash(params.get("target"));
+    if (!target) {
+      throw new ElfinderError("errFileNotFound");
+    }
+    await requireWrite(target);
+    const name = path.posix.basename(target);
+    const badParams = () => new ElfinderError(["errCmdParams", "resize"]);
+
+    const intParam = (key: string, min: number, max: number): number => {
+      const raw = params.get(key) ?? "";
+      const value = Number(raw);
+      if (!/^-?\d+$/.test(raw.trim()) || value < min || value > max) {
+        throw badParams();
+      }
+      return value;
+    };
+
+    const mode = params.get("mode") || "resize";
+    if (mode !== "resize" && mode !== "crop" && mode !== "rotate") {
+      throw badParams();
+    }
+    const box =
+      mode === "rotate"
+        ? null
+        : { width: intParam("width", 1, MAX_EDIT_SIDE), height: intParam("height", 1, MAX_EDIT_SIDE) };
+    const degree = mode === "rotate" ? intParam("degree", -360, 360) : 0;
+    const offset =
+      mode === "crop" ? { left: intParam("x", 0, MAX_EDIT_SIDE), top: intParam("y", 0, MAX_EDIT_SIDE) } : null;
+    const quality = Number(params.get("quality"));
+
+    const { absolute, input } = await readImageSource(target);
+
+    let output: Buffer;
+    try {
+      let image = sharp(input);
+      const { format } = await image.metadata();
+      if (box && offset) {
+        image = image.extract({ ...offset, ...box });
+      } else if (box) {
+        image = image.resize(box.width, box.height, { fit: "fill" });
+      } else {
+        // The client sends a background colour for the corners a rotation exposes;
+        // without one, formats with alpha get transparency and JPEG gets white.
+        const bg = params.get("bg") || (format === "jpeg" ? "#ffffff" : "#00000000");
+        image = image.rotate(degree, { background: bg });
+      }
+      if (format === "jpeg" && quality >= 1 && quality <= 100) {
+        image = image.jpeg({ quality });
+      }
+      output = await image.toBuffer();
+    } catch {
+      throw new ElfinderError(["errResize", name]);
+    }
+
+    // Written aside and renamed over the original, so a failure part-way through
+    // cannot leave a truncated image behind.
+    await fs.mkdir(TMP_DIR, { recursive: true });
+    const staged = path.resolve(TMP_DIR, `${randomUUID()}.resize`);
+    await fs.writeFile(staged, output);
+    await fs.rename(staged, absolute);
+    // The thumbnail name tracks size and mtime, so the old one is now unreachable.
+    await removeThumbsForPaths([target]);
+
+    return NextResponse.json({ changed: [await toFileInfo(target)] });
   }
 
   function toParamBagFromSearchParams(params: URLSearchParams): ParamBag {

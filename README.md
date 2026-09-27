@@ -134,7 +134,6 @@ Uploads are written to `apps/playground/uploads/` by default, and served through
 
 Planned or possible improvements:
 
-- Image `resize` command
 - Storage adapters (S3 and similar), which serverless hosting needs
 - Additional archive formats
 - Stable v1.0 API surface
