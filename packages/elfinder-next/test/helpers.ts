@@ -23,12 +23,35 @@ export function hashOf(relativePath: string, volumeId = "v1_"): string {
 }
 
 const sandboxes: string[] = [];
+const responses: Response[] = [];
 
 afterEach(async () => {
+  // A file response streams from an open handle, and many tests only look at the
+  // headers. A real server cancels a body nobody reads; do the same here, or the
+  // handle keeps the sandbox from being removed on Windows.
   await Promise.all(
-    sandboxes.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
+    responses
+      .splice(0)
+      .map((response) =>
+        response.bodyUsed || !response.body || response.body.locked
+          ? undefined
+          : response.body.cancel().catch(() => {}),
+      ),
+  );
+  // The handle closes asynchronously after the cancel, so allow a few retries.
+  await Promise.all(
+    sandboxes
+      .splice(0)
+      .map((dir) => fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })),
   );
 });
+
+function track(pending: Promise<Response>): Promise<Response> {
+  return pending.then((response) => {
+    responses.push(response);
+    return response;
+  });
+}
 
 export type Volume = {
   /** Directory handed to the connector as `uploadDir`. */
@@ -82,13 +105,17 @@ export async function makeVolume(
     sandbox,
     at,
     GET: (query, init) =>
-      handlers.GET(
-        new NextRequest(`http://localhost/api/elfinder?${query}`, init),
-      ) as unknown as Promise<Response>,
+      track(
+        handlers.GET(
+          new NextRequest(`http://localhost/api/elfinder?${query}`, init),
+        ) as unknown as Promise<Response>,
+      ),
     POST: (body: FormData) =>
-      handlers.POST(
-        new NextRequest("http://localhost/api/elfinder", { method: "POST", body }),
-      ) as unknown as Promise<Response>,
+      track(
+        handlers.POST(
+          new NextRequest("http://localhost/api/elfinder", { method: "POST", body }),
+        ) as unknown as Promise<Response>,
+      ),
     read: (relativePath) => fs.readFile(at(relativePath), "utf8").catch(() => null),
     exists: (relativePath) =>
       fs
