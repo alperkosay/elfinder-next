@@ -428,6 +428,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     cache: Map<string, ResolvedPermission>;
     /** Path of the route serving this request, basePath included. */
     connectorUrl: string;
+    /** Read for conditional requests, so streamFile can answer 304. */
+    headers: Headers;
   };
 
   /**
@@ -1260,6 +1262,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         contentType: "image/png",
         disposition: "inline",
         rangeHeader,
+        cache: "revalidate",
       });
     }
 
@@ -1276,6 +1279,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       contentType,
       disposition,
       rangeHeader,
+      cache: "revalidate",
     });
   }
 
@@ -1285,15 +1289,21 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
    * Shared by cmd=file and the second phase of zipdl, which need identical framing:
    * both must stream rather than buffer, and both must answer ranged requests so a
    * browser can resume or seek.
+   *
+   * Volume files are `private, no-cache` with validators: private because the route
+   * may sit behind `authorize`, and revalidated because a file's URL does not change
+   * when it is overwritten. An unchanged file then costs a 304 rather than a full
+   * download. The zipdl archive is single-use and is never stored.
    */
   function streamFile(
     absolutePath: string,
-    stat: { size: number },
+    stat: { size: number; mtimeMs: number },
     options: {
       filename: string;
       contentType: string;
       disposition: "inline" | "attachment";
       rangeHeader: string | null;
+      cache: "revalidate" | "no-store";
     },
   ): NextResponse {
     const baseHeaders: Record<string, string> = {
@@ -1303,6 +1313,23 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       // Without this the browser will not seek in audio or video previews.
       "Accept-Ranges": "bytes",
     };
+
+    if (options.cache === "no-store") {
+      baseHeaders["Cache-Control"] = "no-store";
+    } else {
+      // Weak: equal size and mtime say the content is the same, not the bytes proven.
+      const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+      const modifiedSeconds = Math.floor(stat.mtimeMs / 1000);
+      const validators = {
+        "Cache-Control": "private, no-cache",
+        ETag: etag,
+        "Last-Modified": new Date(modifiedSeconds * 1000).toUTCString(),
+      };
+      if (isNotModified(etag, modifiedSeconds)) {
+        return new NextResponse(null, { status: 304, headers: validators });
+      }
+      Object.assign(baseHeaders, validators);
+    }
 
     const range = parseRange(options.rangeHeader, stat.size);
     if (range === "unsatisfiable") {
@@ -1329,6 +1356,26 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         ...(range ? { "Content-Range": `bytes ${start}-${end}/${stat.size}` } : {}),
       },
     });
+  }
+
+  /**
+   * Evaluates If-None-Match, or If-Modified-Since when that is absent, as RFC 9110
+   * orders them. ETags compare weakly, which is what a GET revalidation calls for.
+   */
+  function isNotModified(etag: string, modifiedSeconds: number): boolean {
+    const headers = scopeStorage.getStore()?.headers;
+    if (!headers) {
+      return false;
+    }
+    const ifNoneMatch = headers.get("if-none-match");
+    if (ifNoneMatch !== null) {
+      const opaque = (tag: string) => tag.trim().replace(/^W\//, "");
+      return ifNoneMatch
+        .split(",")
+        .some((tag) => tag.trim() === "*" || opaque(tag) === opaque(etag));
+    }
+    const since = Date.parse(headers.get("if-modified-since") ?? "");
+    return !Number.isNaN(since) && modifiedSeconds * 1000 <= since;
   }
 
   async function handleLs(params: ParamBag) {
@@ -1798,6 +1845,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       contentType: "application/zip",
       disposition: "attachment",
       rangeHeader,
+      cache: "no-store",
     });
 
     // A ranged request is one of several for the same archive, so only a whole-body
@@ -2192,7 +2240,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function withScope<T>(req: NextRequest, run: () => Promise<T>): Promise<T> {
     const session = await resolveSession(req);
     const connectorUrl = `${req.nextUrl.basePath}${req.nextUrl.pathname}`;
-    return scopeStorage.run({ session, cache: new Map(), connectorUrl }, run);
+    return scopeStorage.run(
+      { session, cache: new Map(), connectorUrl, headers: req.headers },
+      run,
+    );
   }
 
   async function GET(req: NextRequest) {
