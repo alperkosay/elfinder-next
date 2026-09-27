@@ -55,12 +55,13 @@ function normalizeUrlPrefix(raw: string): string {
 export function resolveContext<Session>(
   options: ElfinderOptions<Session> = {},
 ): ElfinderContext {
-  const uploadDir = path.resolve(
-    options.uploadDir ?? path.join(process.cwd(), "public", "uploads"),
-  );
+  // Outside public/ and with no URL prefixes by default, so every file and thumbnail
+  // goes through the connector. Next's production server snapshots public/ at
+  // startup, so anything uploaded there later answers 404 until a restart.
+  const uploadDir = path.resolve(options.uploadDir ?? path.join(process.cwd(), "uploads"));
   const volumeId = options.volumeId ?? "v1_";
-  const publicUrl = options.publicUrl ?? "/uploads/";
-  const tmbUrl = options.tmbUrl ?? "/uploads/.tmb/";
+  const publicUrl = options.publicUrl ?? "";
+  const tmbUrl = options.tmbUrl ?? "";
 
   return {
     uploadDir,

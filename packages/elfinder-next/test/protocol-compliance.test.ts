@@ -27,12 +27,13 @@ describe("volume options drive the client's menus (items 15, 16, 17)", () => {
   });
 
   it("carries the options on a subfolder too, not only the root", async () => {
-    const vol = await makeVolume({ "sub/a.txt": "x" });
+    // A non-default prefix, so an absent url cannot pass for the default "".
+    const vol = await makeVolume({ "sub/a.txt": "x" }, { publicUrl: "/media/" });
     const body = await json(await vol.GET(`cmd=open&target=${hashOf("sub")}`));
 
     expect(body.cwd.options).toBeDefined();
     expect(body.cwd.options.archivers.create).toEqual(["application/zip"]);
-    expect(body.cwd.options.url).toBe("/uploads/");
+    expect(body.cwd.options.url).toBe("/media/");
   });
 
   it("leaves plain files without an options block", async () => {

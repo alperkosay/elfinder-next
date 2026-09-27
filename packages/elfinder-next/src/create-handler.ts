@@ -11,9 +11,7 @@ import type { ElfinderHandlers, ElfinderOptions } from "./types.js";
  * import { createElfinderHandler } from "elfinder-next";
  *
  * export const { GET, POST, runtime } = createElfinderHandler({
- *   uploadDir: "./public/uploads",
- *   publicUrl: "/uploads/",
- *   tmbUrl: "/uploads/.tmb/",
+ *   uploadDir: process.env.ELFINDER_DIR, // absolute path on persistent storage
  * });
  * ```
  *

@@ -39,22 +39,35 @@ export type ElfinderFile = {
 };
 
 export type ElfinderOptions<Session = unknown> = {
-  /** Absolute or cwd-relative path where files are stored. Default: `public/uploads` */
+  /**
+   * Absolute or cwd-relative path where files are stored. Default: `uploads`,
+   * resolved against `process.cwd()`.
+   *
+   * Pass an absolute path in production. `output: "standalone"` changes the working
+   * directory to `.next/standalone`, so the default would land inside the build
+   * output and be wiped by the next deploy.
+   */
   uploadDir?: string;
   /** Display name for the volume root. Default: `uploads` */
   rootName?: string;
   /** Volume id prefix used in hashes. Default: `v1_` */
   volumeId?: string;
   /**
-   * Public URL prefix for uploaded files. Default: `/uploads/`
+   * Public URL prefix for uploaded files. Default: `""`
    *
-   * Set to `""` when the files are not served statically — for example when
-   * `uploadDir` lives outside `public/`, as it must under `output: "standalone"`
-   * or on a read-only serverless filesystem. elFinder then addresses files
-   * through the connector's `file` command instead of a static path.
+   * Empty means the files have no static URL, so elFinder addresses them through the
+   * connector's `file` command. Set a prefix only when something other than Next's
+   * `public/` directory serves `uploadDir`, such as a CDN or a reverse proxy: Next
+   * reads `public/` once at startup, so files uploaded into it afterwards answer 404
+   * until the server restarts.
    */
   publicUrl?: string;
-  /** Public URL prefix for thumbnails. Default: `/uploads/.tmb/`; `""` for none. */
+  /**
+   * Public URL prefix for the `.tmb` directory. Default: `""`
+   *
+   * Empty means thumbnails are served by the connector too. The same caveat as
+   * `publicUrl` applies.
+   */
   tmbUrl?: string;
   /**
    * Largest number of entries an archive may declare before `extract` refuses

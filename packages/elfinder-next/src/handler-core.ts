@@ -411,6 +411,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     session: unknown;
     /** Memoizes permission lookups so a listing asks about each path once. */
     cache: Map<string, ResolvedPermission>;
+    /** Path of the route serving this request, basePath included. */
+    connectorUrl: string;
   };
 
   /**
@@ -729,6 +731,22 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   /**
+   * What goes in a file's `tmb` field once its thumbnail exists.
+   *
+   * With a `tmbUrl` the client prefixes it, so the bare filename is enough. Without
+   * one the 2.1 client uses `tmb` verbatim as the image URL, so it must be a full
+   * address, and since nothing serves `.tmb` statically that address is the
+   * connector itself.
+   */
+  function thumbReference(relativePath: string, thumbName: string): string {
+    if (TMB_URL) {
+      return thumbName;
+    }
+    const connectorUrl = scopeStorage.getStore()?.connectorUrl ?? "";
+    return `${connectorUrl}?cmd=file&target=${encodeHash(relativePath)}&thumb=1`;
+  }
+
+  /**
    * Deletes every thumbnail belonging to any of `relativePaths`.
    *
    * Reads the thumbnail directory once and matches by path digest, rather than
@@ -858,7 +876,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       // fetch it through cmd=tmb in batches. Generating it here instead would run
       // one sharp resize per image every time a directory is listed, so opening a
       // folder of 500 images would be 500 resizes inside a single request.
-      info.tmb = (await existingThumbForFile(normalized, stat)) ?? "1";
+      const thumbName = await existingThumbForFile(normalized, stat);
+      info.tmb = thumbName ? thumbReference(normalized, thumbName) : "1";
     }
 
     return info;
@@ -1203,6 +1222,23 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errNotFile");
     }
 
+    // The address thumbReference hands out when there is no tmbUrl. Addressed by the
+    // source rather than the thumbnail's own name, so the source's read permission
+    // is what gates it and .tmb never has to be reachable as a path.
+    if (params.get("thumb") === "1") {
+      const thumbName = await existingThumbForFile(target, stat);
+      if (!thumbName) {
+        throw new ElfinderError("errFileNotFound");
+      }
+      const thumbPath = path.resolve(TMB_DIR, thumbName);
+      return streamFile(thumbPath, await fs.stat(thumbPath), {
+        filename: thumbName,
+        contentType: "image/png",
+        disposition: "inline",
+        rangeHeader,
+      });
+    }
+
     const filename = path.posix.basename(target);
     const contentType = mime.lookup(filename) || "application/octet-stream";
     const download = params.get("download") === "1";
@@ -1513,7 +1549,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!thumb) {
         return;
       }
-      images[targetHash] = thumb;
+      images[targetHash] = thumbReference(relative, thumb);
       touchedPaths.push(relative);
       freshNames.add(thumb);
     };
@@ -2126,7 +2162,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   /** Establishes the request scope, so permission lookups can find the session. */
   async function withScope<T>(req: NextRequest, run: () => Promise<T>): Promise<T> {
     const session = await resolveSession(req);
-    return scopeStorage.run({ session, cache: new Map() }, run);
+    const connectorUrl = `${req.nextUrl.basePath}${req.nextUrl.pathname}`;
+    return scopeStorage.run({ session, cache: new Map(), connectorUrl }, run);
   }
 
   async function GET(req: NextRequest) {

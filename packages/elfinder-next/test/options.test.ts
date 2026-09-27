@@ -1,5 +1,6 @@
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { resolveContext } from "../src/context.js";
 import { ROOT_HASH, json, makeVolume } from "./helpers.js";
 
 /** The root volume options elFinder reads on init. */
@@ -10,11 +11,13 @@ async function rootOptions(options = {}) {
 }
 
 describe("url prefixes (item 44)", () => {
-  it("uses /uploads/ by default", async () => {
+  it("serves everything through the connector by default (item 45)", async () => {
+    // Next snapshots public/ at startup, so a static prefix for runtime uploads
+    // answers 404 until a restart. Empty prefixes route through cmd=file instead.
     const { cwd, top } = await rootOptions();
-    expect(cwd.options.url).toBe("/uploads/");
-    expect(cwd.options.tmbUrl).toBe("/uploads/.tmb/");
-    expect(top.tmbUrl).toBe("/uploads/.tmb/");
+    expect(cwd.options.url).toBe("");
+    expect(cwd.options.tmbUrl).toBe("");
+    expect(top.tmbUrl).toBe("");
   });
 
   it("appends a missing trailing slash", async () => {
@@ -53,6 +56,11 @@ describe("volume identity", () => {
 });
 
 describe("uploadDir resolution", () => {
+  it("defaults to a directory outside public/ (item 38)", () => {
+    // Under public/, the half-uploaded parts in .chunks were downloadable by anyone.
+    expect(resolveContext().uploadDir).toBe(path.resolve(process.cwd(), "uploads"));
+  });
+
   it("accepts an absolute uploadDir", async () => {
     const vol = await makeVolume({ "a.txt": "x" });
     expect(path.isAbsolute(vol.uploadDir)).toBe(true);
