@@ -29,6 +29,8 @@ Tamamlanan maddeler (`fix/security-and-core-hardening` ve `fix/thumbnail-lifecyc
 | 15-19, 21-30 | Protokol uyumu (zipdl iki faz, chunk birleştirme, boyut, arama, options) |
 | 38, 42-45 | Varsayılanlar `public/` dışına alındı, connector üzerinden servis, dağıtım belgeleri (`docs/deployment`) |
 | 56 | README sürüm bilgisi (0.2.0) |
+| 50, 53-55, 57, 58 | Temiz klonda playground, LICENSE, npm metadata, Next 14/15 CI işi (`chore/repo-hygiene`) |
+| 59 | Karara bağlandı: CJS yok, `sideEffects` 35'e bağlı |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -42,10 +44,10 @@ pnpm test        # vitest, 194 test
 pnpm typecheck   # kaynak + testler
 ```
 
-**Açıkta kalan:** madde 32, 33 (mimari), 50, 53-55, 57-59 (hijyen ve npm
-metadata), 34-37, 39-41 (küçük düzeltmeler), 61 (izleme uyarısı).
+**Açıkta kalan:** madde 32, 33 (mimari), 34-37, 39-41 (küçük düzeltmeler), 61
+(izleme uyarısı).
 
-Sıradaki bloklar: depo hijyeni ve npm metadata (50, 53-55, 57-59), madde 61,
+Sıradaki bloklar: madde 61 ve küçük düzeltmeler (34-37, 39-41, 35 ile birlikte `sideEffects`),
 ve en büyük iş olarak StorageAdapter soyutlaması (32).
 
 ---
@@ -456,16 +458,18 @@ Aşağıdakiler `git ls-files` ile doğrulandı.
 - [x] **47. Karışık paket yöneticisi.** Kökte hem `package-lock.json` hem `pnpm-lock.yaml` var. npm lockfile'ı neredeyse boş, sil.
 - [x] **48. Build artefaktı commit'lenmiş.** `apps/playground/tsconfig.tsbuildinfo` gitignore'a girmeli.
 - [x] **49. Playground kırık.** `app/page.tsx` butonu `/elfinder-static/picker.html`, iframe'i `/elfinder/picker.html` açıyor. İkisi farklı, biri kesinlikle 404.
-- [ ] **50. Temiz klone playground çalışmıyor.** `.gitignore` içinde `apps/playground/public/elfinder` var, yani elFinder arayüz dosyaları depoda yok ve onları getiren bir adım veya script de yok. README "playground'u çalıştır" diyor ama çalışmıyor.
+- [x] **50. Temiz klone playground çalışmıyor.** `.gitignore` içinde `apps/playground/public/elfinder` var, yani elFinder arayüz dosyaları depoda yok ve onları getiren bir adım veya script de yok. README "playground'u çalıştır" diyor ama çalışmıyor. — YAPILDI. `picker.html` commit'lendi, elFinder 2.1.70 cdnjs'den yükleniyor, indirme adımı yok. Headless Edge ile `next start` üzerinde doğrulandı: ağaç, liste ve connector üzerinden thumbnail görünüyor.
 - [x] **51. Test yok.** — YAPILDI, 99 test 7 dosyada. Bir protokol connector'ı tam olarak sözleşme testi gerektiren şey. Geçici dizin ve fixture istekleriyle vitest kurmak bir günlük iş, yukarıdaki hataların çoğunu regresyona karşı kilitler.
 - [x] **52. CI yok.** — YAPILDI, 3 OS x Node 20/22 artı bloke etmeyen Node 18 işi. Build, test ve lint için bir workflow ekle.
-- [ ] **53. `LICENSE` dosyası yok.** README'deki rozet var olmayan bir dosyaya bağlanıyor.
-- [ ] **54.** `package.json` içinde `repository`, `homepage`, `bugs` ve `engines` alanları eksik. npm sayfasında kaynak bağlantısı görünmeyecek.
-- [ ] **55.** `files` dizisi `LICENSE`'ı da içermeli.
+- [x] **53. `LICENSE` dosyası yok.** README'deki rozet var olmayan bir dosyaya bağlanıyor. — YAPILDI, kökte ve pakette.
+- [x] **54.** `package.json` içinde `repository`, `homepage`, `bugs` ve `engines` alanları eksik. npm sayfasında kaynak bağlantısı görünmeyecek. — YAPILDI (`engines` madde 60 ile gelmişti).
+- [x] **55.** `files` dizisi `LICENSE`'ı da içermeli. — YAPILDI, `npm pack` çıktısında görünüyor.
 - [x] **56.** README hâlâ `v0.1.0` diyor, paket `0.1.1`. — YAPILDI, ikisi de 0.2.0.
-- [ ] **57.** Root README'deki `https://github.com/your-org/elfinder-next` placeholder'ını gerçek URL ile değiştir.
-- [ ] **58. Peer aralığı doğrulanmamış.** `peerDependencies` `next >= 14` diyor ama hem devDependency hem playground `16.2.6` kullanıyor. 14 ve 15 hiç denenmemiş. Ya CI'a matris ekle ya aralığı daralt.
-- [ ] **59.** CJS build eklemeyi düşün (`format: ["esm", "cjs"]`), `sideEffects: false` ekle.
+- [x] **57.** Root README'deki `https://github.com/your-org/elfinder-next` placeholder'ını gerçek URL ile değiştir. — YAPILDI, kök README'deki `git clone <repository-url>` satırı da.
+- [x] **58. Peer aralığı doğrulanmamış.** `peerDependencies` `next >= 14` diyor ama hem devDependency hem playground `16.2.6` kullanıyor. 14 ve 15 hiç denenmemiş. Ya CI'a matris ekle ya aralığı daralt. — DOĞRULANDI, aralık korundu. 14.2.35 ve 15.5.26 üzerinde test paketi ve typecheck geçiyor. Tarball ile kurulan birer uygulamada yükleme, thumbnail ve arşiv `next start` altında çalışıyor. CI'a `next-compat` işi eklendi (14.2, 15.5). Next 14'te `serverExternalPackages` anahtarı tanınmıyor, README'ye not düşüldü.
+- [x] **59.** CJS build eklemeyi düşün (`format: ["esm", "cjs"]`), `sideEffects: false` ekle. — KARARA BAĞLANDI.
+  - CJS eklenmedi. Desteklenen her Next sürümü ESM paketi bundle ediyor (14 ve 15 dahil doğrulandı). Çift format ise `ElfinderError` için dual-package tehlikesi yaratır: iki kopya olursa `instanceof` bozulur.
+  - `sideEffects: false` eklenmedi. Modül yüklenirken `sharp.cache()` çağrılıyor (madde 35), yani beyan yanlış olur. 35 kapsamlandığında eklenmeli.
 
 ### 60. Node desteği iddiası yanlıştı — YAPILDI
 
@@ -489,7 +493,7 @@ Karar: iddia daraltıldı, globalden vazgeçilmedi.
 - [x] CI matrisi tabanı gerçekten test ediyor (`20.3` ve `22`)
 - [x] Bloke etmeyen `node18` işi kaldırıldı, sorusu cevaplandı
 
-Not: madde 54'teki `repository`, `homepage` ve `bugs` alanları hâlâ eksik.
+Not: madde 54'teki `repository`, `homepage` ve `bugs` alanları `chore/repo-hygiene` dalında eklendi.
 
 ---
 
