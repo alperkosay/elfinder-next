@@ -38,7 +38,10 @@ jobs:
 
       - name: Build playground
         # Catches what the unit tests cannot: that the built package still
-        # type-checks and bundles inside a real Next.js app.
+        # type-checks and bundles inside a real Next.js app. Skipped on the
+        # engines floor: the playground runs Next 16, which needs Node >= 20.9,
+        # while the package itself still supports 20.3 with Next 14/15.
+        if: matrix.node != '20.3'
         run: pnpm --filter playground build
 
   next-compat:

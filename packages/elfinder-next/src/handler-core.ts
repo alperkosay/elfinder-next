@@ -252,6 +252,35 @@ function contentDisposition(filename: string, disposition: "inline" | "attachmen
 }
 
 /**
+ * Wraps a Node stream as a web ReadableStream, pulling one chunk at a time.
+ *
+ * `Readable.toWeb` is not used: before Node 20.x fixed it, the source's `close`
+ * event after a cancel calls `controller.close()` a second time, and that throws
+ * as an uncaught exception. A client aborting a download is enough to trigger it.
+ */
+function toWebStream(source: Readable): ReadableStream<Uint8Array> {
+  const chunks = source[Symbol.asyncIterator]() as AsyncIterator<Buffer>;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { value, done } = await chunks.next();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+        }
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    async cancel() {
+      // Ending the iterator early destroys the source, which closes the file.
+      await chunks.return?.();
+    },
+  });
+}
+
+/**
  * Normalizes a zip entry name to a relative POSIX path, or returns `null` when
  * the entry cannot be trusted.
  *
@@ -1346,7 +1375,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     // Streamed rather than read into a buffer: a large file would otherwise be
     // held in memory in full, once per concurrent request.
     const source = createReadStream(absolutePath, stat.size === 0 ? {} : { start, end });
-    const body = Readable.toWeb(source) as ReadableStream<Uint8Array>;
+    const body = toWebStream(source);
 
     return new NextResponse(body, {
       status: range ? 206 : 200,
