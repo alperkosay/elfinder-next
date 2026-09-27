@@ -10,6 +10,8 @@ export type ElfinderContext = {
   chunkDir: string;
   publicUrl: string;
   tmbUrl: string;
+  maxArchiveEntries: number;
+  maxArchiveBytes: number;
 };
 
 export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
@@ -29,5 +31,7 @@ export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
     chunkDir: path.resolve(uploadDir, ".chunks"),
     publicUrl: publicUrl.endsWith("/") ? publicUrl : `${publicUrl}/`,
     tmbUrl: tmbUrl.endsWith("/") ? tmbUrl : `${tmbUrl}/`,
+    maxArchiveEntries: options.maxArchiveEntries ?? 10_000,
+    maxArchiveBytes: options.maxArchiveBytes ?? 1024 * 1024 * 1024,
   };
 }

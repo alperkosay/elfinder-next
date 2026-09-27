@@ -34,6 +34,16 @@ export type ElfinderOptions = {
   publicUrl?: string;
   /** Public URL prefix for thumbnails. Default: `/uploads/.tmb/` */
   tmbUrl?: string;
+  /**
+   * Largest number of entries an archive may declare before `extract` refuses
+   * it. Guards against archives built to exhaust inodes. Default: `10000`
+   */
+  maxArchiveEntries?: number;
+  /**
+   * Largest total uncompressed size, in bytes, that `extract` will unpack.
+   * Guards against compression bombs. Default: 1 GiB
+   */
+  maxArchiveBytes?: number;
 };
 
 export type ElfinderHandlers = {

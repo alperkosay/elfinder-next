@@ -74,6 +74,13 @@ async function rmWithRetry(
   throw lastError;
 }
 
+type ZipEntry = {
+  entryName: string;
+  isDirectory: boolean;
+  header: { size: number };
+  getData: () => Buffer;
+};
+
 type ZipAdapter = {
   addLocalFolder: (localPath: string, zipPath?: string) => void;
   addLocalFile: (
@@ -83,8 +90,32 @@ type ZipAdapter = {
     comment?: string,
   ) => void;
   writeZip: (targetFileName?: string) => void;
-  extractAllTo: (targetPath: string, overwrite?: boolean) => void;
+  getEntries: () => ZipEntry[];
 };
+
+/**
+ * Normalizes a zip entry name to a relative POSIX path, or returns `null` when
+ * the entry cannot be trusted.
+ *
+ * Archives are attacker-controlled input. Entry names may be absolute, may use
+ * backslashes, and may contain `..` segments that walk out of the extraction
+ * directory ("zip slip").
+ */
+function safeEntryPath(entryName: string): string | null {
+  const cleaned = entryName.replace(/\\/g, "/");
+  if (/^([a-zA-Z]:)?\//.test(cleaned)) {
+    return null;
+  }
+  const segments = cleaned.split("/").filter((segment) => segment && segment !== ".");
+  if (segments.length === 0) {
+    return null;
+  }
+  // eslint-disable-next-line no-control-regex
+  if (segments.some((segment) => segment === ".." || /[\u0000-\u001f]/.test(segment))) {
+    return null;
+  }
+  return segments.join("/");
+}
 
 export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   const {
@@ -96,6 +127,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     chunkDir: CHUNK_DIR,
     publicUrl: PUBLIC_URL,
     tmbUrl: TMB_URL,
+    maxArchiveEntries: MAX_ARCHIVE_ENTRIES,
+    maxArchiveBytes: MAX_ARCHIVE_BYTES,
   } = ctx;
 
   function normalizeRelativePath(raw: string): string {
@@ -726,14 +759,45 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       ? normalizeRelativePath(sourceParent ? `${sourceParent}/${sourceBase}` : sourceBase)
       : sourceParent;
     const outputAbs = resolveWithinRoot(outputRel);
+
+    // Validate the whole archive before writing a single byte, so a malicious
+    // entry halfway through cannot leave a half-extracted tree behind.
+    const entries = zip.getEntries();
+    if (entries.length > MAX_ARCHIVE_ENTRIES) {
+      throw new ElfinderError("errArcMaxSize");
+    }
+
+    let declaredBytes = 0;
+    const planned: Array<{ entry: ZipEntry; absolute: string }> = [];
+    for (const entry of entries) {
+      const relative = safeEntryPath(entry.entryName);
+      if (!relative) {
+        throw new ElfinderError("errArcSymlinks");
+      }
+      const absolute = path.resolve(outputAbs, relative);
+      assertWithin(outputAbs, absolute);
+      declaredBytes += entry.header.size;
+      if (declaredBytes > MAX_ARCHIVE_BYTES) {
+        throw new ElfinderError("errArcMaxSize");
+      }
+      planned.push({ entry, absolute });
+    }
+
     await fs.mkdir(outputAbs, { recursive: true });
-    zip.extractAllTo(outputAbs, true);
+    for (const { entry, absolute } of planned) {
+      if (entry.isDirectory) {
+        await fs.mkdir(absolute, { recursive: true });
+        continue;
+      }
+      await fs.mkdir(path.dirname(absolute), { recursive: true });
+      await fs.writeFile(absolute, entry.getData());
+    }
 
     const added: ElfinderFile[] = [];
-    const entries = await fs.readdir(outputAbs, { withFileTypes: true });
-    for (const entry of entries) {
+    const children = await fs.readdir(outputAbs, { withFileTypes: true });
+    for (const child of children) {
       const rel = normalizeRelativePath(
-        outputRel ? `${outputRel}/${entry.name}` : entry.name,
+        outputRel ? `${outputRel}/${child.name}` : child.name,
       );
       added.push(await toFileInfo(rel));
     }
