@@ -326,11 +326,52 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return decoded;
   }
 
-  function resolveWithinRoot(relativePath: string): string {
+  let realRootPromise: Promise<string> | null = null;
+
+  /**
+   * The volume root with symlinks resolved, cached for the handler's lifetime.
+   *
+   * The root itself is often a link — `public/uploads` pointing at a mounted
+   * volume is a normal deployment — so containment has to be judged against the
+   * resolved root, not the configured one.
+   */
+  function realRoot(): Promise<string> {
+    if (!realRootPromise) {
+      realRootPromise = fs.realpath(UPLOAD_DIR).catch((error: unknown) => {
+        // Do not cache a failure; the directory may simply not exist yet.
+        realRootPromise = null;
+        throw error;
+      });
+    }
+    return realRootPromise;
+  }
+
+  async function resolveWithinRoot(relativePath: string): Promise<string> {
     const safeRelative = normalizeRelativePath(relativePath);
     const absolute = path.resolve(UPLOAD_DIR, safeRelative);
     assertWithin(UPLOAD_DIR, absolute);
-    return absolute;
+
+    // The check above is lexical and cannot see symlinks. Walk up to the deepest
+    // component that exists, resolve that, and confirm it is still inside the
+    // volume. A component that does not exist yet cannot be a link, so stopping
+    // at the first one that does is sufficient.
+    const root = await realRoot();
+    let probe = absolute;
+    for (;;) {
+      try {
+        assertWithin(root, await fs.realpath(probe));
+        return absolute;
+      } catch (error) {
+        if (error instanceof ElfinderError) {
+          throw error;
+        }
+        const parent = path.dirname(probe);
+        if (parent === probe) {
+          throw new ElfinderError("errAccess");
+        }
+        probe = parent;
+      }
+    }
   }
 
   async function ensureUploadDir(): Promise<void> {
@@ -406,7 +447,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
     try {
       // Read into a buffer so sharp never holds a path-based lock on the source file.
-      const input = await fs.readFile(resolveWithinRoot(normalized));
+      const input = await fs.readFile(await resolveWithinRoot(normalized));
       await sharp(input)
         .resize(48, 48, { fit: "inside", withoutEnlargement: true })
         .png()
@@ -437,7 +478,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function toFileInfo(relativePath: string): Promise<ElfinderFile> {
     const normalized = normalizeRelativePath(relativePath);
-    const absolutePath = resolveWithinRoot(normalized);
+    const absolutePath = await resolveWithinRoot(normalized);
     const stat = await fs.stat(absolutePath);
     const isDir = stat.isDirectory();
     const parent = normalizeRelativePath(path.posix.dirname(normalized));
@@ -490,7 +531,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function listDirectory(relativeDir: string): Promise<ElfinderFile[]> {
     const baseRelative = normalizeRelativePath(relativeDir);
-    const absoluteDir = resolveWithinRoot(baseRelative);
+    const absoluteDir = await resolveWithinRoot(baseRelative);
     const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
     const visible = entries.filter(
       (entry) => entry.name !== ".tmb" && entry.name !== ".chunks",
@@ -609,7 +650,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
     if (target) {
       try {
-        await fs.stat(resolveWithinRoot(target));
+        await fs.stat(await resolveWithinRoot(target));
       } catch {
         target = "";
       }
@@ -673,7 +714,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errInvName");
     }
     const targetRelative = normalizeRelativePath(target ? `${target}/${name}` : name);
-    const absolute = resolveWithinRoot(targetRelative);
+    const absolute = await resolveWithinRoot(targetRelative);
     await fs.mkdir(absolute, { recursive: false });
     return NextResponse.json({ added: [await toFileInfo(targetRelative)] });
   }
@@ -690,7 +731,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!relative) {
         continue;
       }
-      const absolute = resolveWithinRoot(relative);
+      const absolute = await resolveWithinRoot(relative);
       await rmWithRetry(absolute, { recursive: true, force: true });
       await removeThumbForHash(hash);
       removed.push(hash);
@@ -713,8 +754,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
     const parent = normalizeRelativePath(path.posix.dirname(oldRelative));
     const newRelative = normalizeRelativePath(parent ? `${parent}/${name}` : name);
-    const oldAbsolute = resolveWithinRoot(oldRelative);
-    const newAbsolute = resolveWithinRoot(newRelative);
+    const oldAbsolute = await resolveWithinRoot(oldRelative);
+    const newAbsolute = await resolveWithinRoot(newRelative);
     await assertNotOccupied(newAbsolute, oldAbsolute);
     await fs.rename(oldAbsolute, newAbsolute);
 
@@ -730,7 +771,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errFileNotFound");
     }
 
-    const absolute = resolveWithinRoot(target);
+    const absolute = await resolveWithinRoot(target);
     const stat = await fs.stat(absolute);
     if (!stat.isFile()) {
       throw new ElfinderError("errNotFile");
@@ -789,7 +830,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
     const name = (params.get("name") || "newfile.txt").trim();
     const relative = normalizeRelativePath(target ? `${target}/${name}` : name);
-    await fs.writeFile(resolveWithinRoot(relative), "");
+    await fs.writeFile(await resolveWithinRoot(relative), "");
     return NextResponse.json({ added: [await toFileInfo(relative)] });
   }
 
@@ -798,7 +839,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     if (!target) {
       throw new ElfinderError("errFileNotFound");
     }
-    const content = await fs.readFile(resolveWithinRoot(target), "utf8");
+    const content = await fs.readFile(await resolveWithinRoot(target), "utf8");
     return NextResponse.json({ content });
   }
 
@@ -808,7 +849,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errFileNotFound");
     }
     const content = params.get("content") ?? "";
-    await fs.writeFile(resolveWithinRoot(target), content, "utf8");
+    await fs.writeFile(await resolveWithinRoot(target), content, "utf8");
     return NextResponse.json({ changed: [await toFileInfo(target)] });
   }
 
@@ -831,13 +872,13 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!sourceRel) {
         continue;
       }
-      const sourceAbs = resolveWithinRoot(sourceRel);
+      const sourceAbs = await resolveWithinRoot(sourceRel);
       const ext = path.posix.extname(sourceRel);
       const base = path.posix.basename(sourceRel, ext);
       const parent = normalizeRelativePath(path.posix.dirname(sourceRel));
       const copyName = `${base}(copy)${ext}`;
       const destRel = normalizeRelativePath(parent ? `${parent}/${copyName}` : copyName);
-      await fs.cp(sourceAbs, resolveWithinRoot(destRel), {
+      await fs.cp(sourceAbs, await resolveWithinRoot(destRel), {
         recursive: true,
         errorOnExist: true,
         force: false,
@@ -863,11 +904,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!sourceRel) {
         continue;
       }
-      const sourceAbs = resolveWithinRoot(sourceRel);
+      const sourceAbs = await resolveWithinRoot(sourceRel);
       const sourceName = path.posix.basename(sourceRel);
       const finalName = renames.has(sourceName) ? suffixName(sourceName, suffix) : sourceName;
       const destRel = normalizeRelativePath(dst ? `${dst}/${finalName}` : finalName);
-      const destAbs = resolveWithinRoot(destRel);
+      const destAbs = await resolveWithinRoot(destRel);
 
       if (cut) {
         await movePath(sourceAbs, destAbs);
@@ -893,7 +934,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       return NextResponse.json({ files: [] });
     }
 
-    const base = resolveWithinRoot(target);
+    const base = await resolveWithinRoot(target);
     const files: ElfinderFile[] = [];
     await walkRecursive(base, async (fullPath) => {
       if (path.basename(fullPath).toLowerCase().includes(q.toLowerCase())) {
@@ -912,7 +953,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!rel) {
         continue;
       }
-      const abs = resolveWithinRoot(rel);
+      const abs = await resolveWithinRoot(rel);
       const st = await fs.stat(abs);
       total += st.size;
     }
@@ -984,10 +1025,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!rel) {
         continue;
       }
-      const abs = resolveWithinRoot(rel);
+      const abs = await resolveWithinRoot(rel);
       await addPathToZip(zip, abs, path.posix.basename(rel));
     }
-    zip.writeZip(resolveWithinRoot(archiveRel));
+    zip.writeZip(await resolveWithinRoot(archiveRel));
     return NextResponse.json({ added: [await toFileInfo(archiveRel)] });
   }
 
@@ -997,14 +1038,14 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errFileNotFound");
     }
     const makedir = isTruthy(params.get("makedir"));
-    const zipAbs = resolveWithinRoot(target);
+    const zipAbs = await resolveWithinRoot(target);
     const zip = new (AdmZip as unknown as new (path: string) => ZipAdapter)(zipAbs);
     const sourceParent = normalizeRelativePath(path.posix.dirname(target));
     const sourceBase = path.posix.basename(target, path.posix.extname(target));
     const outputRel = makedir
       ? normalizeRelativePath(sourceParent ? `${sourceParent}/${sourceBase}` : sourceBase)
       : sourceParent;
-    const outputAbs = resolveWithinRoot(outputRel);
+    const outputAbs = await resolveWithinRoot(outputRel);
 
     // Validate the whole archive before writing a single byte, so a malicious
     // entry halfway through cannot leave a half-extracted tree behind.
@@ -1068,9 +1109,9 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!rel) {
         continue;
       }
-      await addPathToZip(zip, resolveWithinRoot(rel), path.posix.basename(rel));
+      await addPathToZip(zip, await resolveWithinRoot(rel), path.posix.basename(rel));
     }
-    zip.writeZip(resolveWithinRoot(zipRel));
+    zip.writeZip(await resolveWithinRoot(zipRel));
 
     return NextResponse.json({
       zipdl: {
@@ -1169,7 +1210,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       formData.get("target") as string | null,
       "errTrgFolderNotFound",
     );
-    const uploadTarget = resolveWithinRoot(target);
+    const uploadTarget = await resolveWithinRoot(target);
     await fs.mkdir(uploadTarget, { recursive: true });
 
     const uploads = formData.getAll("upload[]").filter((f): f is File => f instanceof File);
@@ -1192,7 +1233,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (uploadPathValues.length > 0) {
         const firstPathDir = normalizeRelativePath(path.posix.dirname(uploadPathValues[0]));
         if (firstPathDir) {
-          destinationDir = resolveWithinRoot(
+          destinationDir = await resolveWithinRoot(
             target ? `${target}/${firstPathDir}` : firstPathDir,
           );
           await fs.mkdir(destinationDir, { recursive: true });
@@ -1295,7 +1336,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         uploadSubdir ? `${uploadSubdir}/${uploadFilename}` : uploadFilename,
       );
       const relative = normalizeRelativePath(target ? `${target}/${uploadPath}` : uploadPath);
-      const absolute = resolveWithinRoot(relative);
+      const absolute = await resolveWithinRoot(relative);
       await fs.mkdir(path.dirname(absolute), { recursive: true });
       const data = Buffer.from(await upload.arrayBuffer());
       await fs.writeFile(absolute, data);
