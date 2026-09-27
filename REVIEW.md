@@ -25,6 +25,7 @@ Tamamlanan maddeler (`fix/security-and-core-hardening` ve `fix/thumbnail-lifecyc
 | 51, 52 | vitest sözleşme testleri ve GitHub Actions CI |
 | 60 | Node desteği 20.3+ olarak daraltıldı |
 | 10, 11, 13 | Thumbnail parmak izi, temizlik ve chunk toplayıcı |
+| 14 | Auth ve yol başına izin kancaları |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -34,15 +35,15 @@ oluyor.
 Komutlar:
 
 ```bash
-pnpm test        # vitest, 108 test
+pnpm test        # vitest, 146 test
 pnpm typecheck   # kaynak + testler
 ```
 
-**Açıkta kalan:** madde 14 (auth kancaları), 15-19 ve 21-30 (protokol),
+**Açıkta kalan:** madde 15-19 ve 21-30 (protokol),
 31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen ve npm metadata).
 
-Sıradaki en yüksek getirili madde 14. Kütüphane onsuz üretimde kullanılamıyor ve
-tek gerçek API tasarım kararı orada.
+Sıradaki en büyük blok protokol uyumu (15-19, 21-30): on altı madde, çoğu beş ila
+yirmi satır.
 
 ---
 
@@ -266,16 +267,16 @@ Yalnızca silinen hedefin thumbnail'i siliniyor. İçinde 100 görsel olan bir k
 
 ## P1 — Auth ve izinler
 
-### 14. Kimlik doğrulama kancası yok
+### 14. Kimlik doğrulama kancası yok — YAPILDI, `authorize` + `permissions`
 
 README "yetkilendirme sizin sorumluluğunuz" diyor ama kütüphane hiçbir bağlanma noktası sunmuyor. `read`, `write`, `locked` alanları `types.ts` içinde literal `1`, `1`, `0` olarak sabitlenmiş. Salt okunur bir klasörü ifade etmek **tip düzeyinde bile** mümkün değil.
 
 Bu, paketi üretime uygun hale getirecek tek en önemli eklenti.
 
-- [ ] `onRequest(req)` kancası ekle
-- [ ] Yol başına izin veren `permissions(path)` geri çağrısı ekle
-- [ ] `types.ts` içinde `read`, `write`, `locked` alanlarını `0 | 1` yap
-- [ ] Kök klasörü varsayılan olarak `locked: 1` yapmayı düşün
+- [x] `onRequest(req)` kancası ekle
+- [x] Yol başına izin veren `permissions(path)` geri çağrısı ekle
+- [x] `types.ts` içinde `read`, `write`, `locked` alanlarını `0 | 1` yap
+- [x] Kök klasörü varsayılan olarak `locked: 1` yapmayı düşün
 
 ---
 
@@ -283,22 +284,22 @@ Bu, paketi üretime uygun hale getirecek tek en önemli eklenti.
 
 Uygulama ile istemciye bildirilen yetenekler birkaç yerde çelişiyor.
 
-- [ ] **15. `handler-core.ts:247`** — `archivers` listeleri boş. elFinder arayüzü arşivleme ve çıkarma menülerini hiç göstermiyor, oysa `handleArchive` ve `handleExtract` yazılmış. `create` ve `extract` içine `application/zip` koy.
-- [ ] **16. `disabled` listesi** — içinde `size` var ama `handleSize` uygulanmış.
-- [ ] **17. `options` nesnesi** — yalnızca kök için üretiliyor. Alt klasör açıldığında `cwd.options` boş geliyor, arşiv menüsü alt klasörlerde de kapalı kalıyor.
-- [ ] **18. `handleSize` (`handler-core.ts:616`)** — klasörlere inmiyor, sadece dizin inode boyutunu topluyor. Klasör boyutu yanlış çıkıyor.
-- [ ] **19. `handleZipdl`** — zip'i kullanıcının klasörüne kalıcı yazıyor ve elFinder'ın ikinci aşama indirme çağrısını karşılamıyor. Çoklu dosya indirme çalışmıyor, üstelik klasörde artık zip bırakıyor.
+- [x] **15. `handler-core.ts:247`** — `archivers` listeleri boş. elFinder arayüzü arşivleme ve çıkarma menülerini hiç göstermiyor, oysa `handleArchive` ve `handleExtract` yazılmış. `create` ve `extract` içine `application/zip` koy.
+- [x] **16. `disabled` listesi** — içinde `size` var ama `handleSize` uygulanmış.
+- [x] **17. `options` nesnesi** — yalnızca kök için üretiliyor. Alt klasör açıldığında `cwd.options` boş geliyor, arşiv menüsü alt klasörlerde de kapalı kalıyor.
+- [x] **18. `handleSize` (`handler-core.ts:616`)** — klasörlere inmiyor, sadece dizin inode boyutunu topluyor. Klasör boyutu yanlış çıkıyor.
+- [x] **19. `handleZipdl`** — zip'i kullanıcının klasörüne kalıcı yazıyor ve elFinder'ın ikinci aşama indirme çağrısını karşılamıyor. Çoklu dosya indirme çalışmıyor, üstelik klasörde artık zip bırakıyor.
 - [x] **20. HTTP durum kodları** — YAPILDI, madde 5 ile birlikte. Komut hataları artık HTTP 200 gövdesinde `{ "error": ["errPerm"] }` biçiminde dönüyor. 400 ve 500 dönmek istemcide bağlantı hatası olarak ele alınıyor ve gerçek mesajı yok ediyordu. i18n kod dizileri de aynı değişiklikle geldi.
-- [ ] **21. `handleSearch`** — `.tmb` ve `.chunks` klasörlerini de tarıyor. Sonuçlara thumbnail ve chunk parçaları karışıyor, `listDirectory`'deki filtre buraya uygulanmamış. Ayrıca derinlik ve sonuç sınırı yok.
-- [ ] **22. `handlePaste`** — bir klasörü kendi alt klasörüne taşımayı engellemiyor.
-- [ ] **23. `handleDuplicate`** — `(copy)` çakışmasını kontrol etmiyor, ikinci kopyada `errorOnExist` fırlatıyor. elFinder `file(1)`, `file(2)` bekliyor.
-- [ ] **24. `handleExtract` sonucu** — `added` listesine çıktı klasöründeki **tüm** girdileri koyuyor, sadece yeni çıkanları değil. 500 dosyalı bir klasöre `makedir` olmadan açım yapılırsa istemci 500 girdi görüyor ve mükerrer satırlar oluşuyor.
-- [ ] **25. `_chunkmerged` sapması** — son olmayan her chunk için `_chunkmerged` döndürülüyor. Referans PHP connector'ı bunu yalnızca tüm parçalar geldiğinde döndürüyor. Birleştirme burada son chunk'ta yapıldığı için sonuç kazara doğru çıkıyor, ama istemci gereksiz merge istekleri gönderiyor. İstemciye karşı doğrulanmalı.
-- [ ] **26. Sırasız chunk yarışı** — `isLastChunk` yalnızca `start + size >= total` bakıyor. Parçalar paralel gönderildiği için en son offset'li parça diğerlerinden önce varırsa birleştirme eksik parçalarla başlıyor ve dosya kırpılıyor. Gelen parça sayısını veya toplam baytı saymak gerekiyor.
-- [ ] **27. `open` içinde `tree=1` yok sayılıyor** — elFinder `cmd=open&init=1&tree=1` gönderiyor. Bu durumda connector'ın ağaç klasörlerini de `files` içinde döndürmesi bekleniyor. Sol paneldeki ağaç eksik kalabilir.
-- [ ] **28. `uplMaxSize` ve `uplMaxFile`** — `open` yanıtında yok, istemci yükleme boyutunu önceden doğrulayamıyor.
-- [ ] **29. `mkdir` / `mkfile` EEXIST** — var olan ad için 500 fırlatıyor, `errExists` döndürmeli.
-- [ ] **30. `handleGet` sadece utf8** — ikili dosyada bozuk içerik dönüyor, `conv` parametresi desteklenmiyor.
+- [x] **21. `handleSearch`** — `.tmb` ve `.chunks` klasörlerini de tarıyor. Sonuçlara thumbnail ve chunk parçaları karışıyor, `listDirectory`'deki filtre buraya uygulanmamış. Ayrıca derinlik ve sonuç sınırı yok.
+- [x] **22. `handlePaste`** — bir klasörü kendi alt klasörüne taşımayı engellemiyor.
+- [x] **23. `handleDuplicate`** — `(copy)` çakışmasını kontrol etmiyor, ikinci kopyada `errorOnExist` fırlatıyor. elFinder `file(1)`, `file(2)` bekliyor.
+- [x] **24. `handleExtract` sonucu** — `added` listesine çıktı klasöründeki **tüm** girdileri koyuyor, sadece yeni çıkanları değil. 500 dosyalı bir klasöre `makedir` olmadan açım yapılırsa istemci 500 girdi görüyor ve mükerrer satırlar oluşuyor.
+- [x] **25. `_chunkmerged` sapması** — son olmayan her chunk için `_chunkmerged` döndürülüyor. Referans PHP connector'ı bunu yalnızca tüm parçalar geldiğinde döndürüyor. Birleştirme burada son chunk'ta yapıldığı için sonuç kazara doğru çıkıyor, ama istemci gereksiz merge istekleri gönderiyor. İstemciye karşı doğrulanmalı.
+- [x] **26. Sırasız chunk yarışı** — `isLastChunk` yalnızca `start + size >= total` bakıyor. Parçalar paralel gönderildiği için en son offset'li parça diğerlerinden önce varırsa birleştirme eksik parçalarla başlıyor ve dosya kırpılıyor. Gelen parça sayısını veya toplam baytı saymak gerekiyor.
+- [x] **27. `open` içinde `tree=1` yok sayılıyor** — elFinder `cmd=open&init=1&tree=1` gönderiyor. Bu durumda connector'ın ağaç klasörlerini de `files` içinde döndürmesi bekleniyor. Sol paneldeki ağaç eksik kalabilir.
+- [x] **28. `uplMaxSize` ve `uplMaxFile`** — `open` yanıtında yok, istemci yükleme boyutunu önceden doğrulayamıyor.
+- [x] **29. `mkdir` / `mkfile` EEXIST** — var olan ad için 500 fırlatıyor, `errExists` döndürmeli.
+- [x] **30. `handleGet` sadece utf8** — ikili dosyada bozuk içerik dönüyor, `conv` parametresi desteklenmiyor.
 
 ---
 
