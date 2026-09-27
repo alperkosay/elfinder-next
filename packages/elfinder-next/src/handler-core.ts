@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
+import { createReadStream } from "fs";
+import { Readable } from "stream";
 import path from "path";
 import mime from "mime-types";
 import AdmZip from "adm-zip";
@@ -125,6 +127,52 @@ const INLINE_SAFE_MIME = new Set([
 
 function isInlineSafeMime(mimeType: string): boolean {
   return INLINE_SAFE_MIME.has(mimeType.split(";")[0].trim().toLowerCase());
+}
+
+type ByteRange = { start: number; end: number };
+
+/**
+ * Parses a single-range `Range` header.
+ *
+ * Returns `null` when the whole body should be sent — no header, a malformed one,
+ * or a multi-range request this handler does not implement — and `"unsatisfiable"`
+ * when the client asked for bytes that do not exist, which owes a 416.
+ */
+function parseRange(header: string | null, size: number): ByteRange | null | "unsatisfiable" {
+  if (!header) {
+    return null;
+  }
+  const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
+  if (!match) {
+    return null;
+  }
+  const [, rawStart, rawEnd] = match;
+  if (rawStart === "" && rawEnd === "") {
+    return null;
+  }
+  if (size === 0) {
+    return "unsatisfiable";
+  }
+
+  let start: number;
+  let end: number;
+  if (rawStart === "") {
+    // Suffix form: `bytes=-500` means the final 500 bytes.
+    const suffix = Number(rawEnd);
+    if (!Number.isFinite(suffix) || suffix <= 0) {
+      return "unsatisfiable";
+    }
+    start = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    start = Number(rawStart);
+    end = rawEnd === "" ? size - 1 : Number(rawEnd);
+  }
+
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) {
+    return "unsatisfiable";
+  }
+  return { start, end: Math.min(end, size - 1) };
 }
 
 /**
@@ -560,7 +608,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     });
   }
 
-  async function handleFile(params: ParamBag) {
+  async function handleFile(params: ParamBag, rangeHeader: string | null) {
     const target = decodeHash(params.get("target"));
     if (!target) {
       throw new ElfinderError("errFileNotFound");
@@ -572,7 +620,6 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errNotFile");
     }
 
-    const data = await fs.readFile(absolute);
     const filename = path.posix.basename(target);
     const contentType = mime.lookup(filename) || "application/octet-stream";
     const download = params.get("download") === "1";
@@ -581,12 +628,37 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     // when elFinder asked to preview it.
     const disposition = !download && isInlineSafeMime(contentType) ? "inline" : "attachment";
 
-    return new NextResponse(data, {
+    const baseHeaders: Record<string, string> = {
+      "Content-Type": contentType,
+      "Content-Disposition": contentDisposition(filename, disposition),
+      "X-Content-Type-Options": "nosniff",
+      // Without this the browser will not seek in audio or video previews.
+      "Accept-Ranges": "bytes",
+    };
+
+    const range = parseRange(rangeHeader, stat.size);
+    if (range === "unsatisfiable") {
+      return new NextResponse(null, {
+        status: 416,
+        headers: { ...baseHeaders, "Content-Range": `bytes */${stat.size}` },
+      });
+    }
+
+    const start = range ? range.start : 0;
+    const end = range ? range.end : Math.max(0, stat.size - 1);
+    const length = stat.size === 0 ? 0 : end - start + 1;
+
+    // Streamed rather than read into a buffer: a large file would otherwise be
+    // held in memory in full, once per concurrent request.
+    const source = createReadStream(absolute, stat.size === 0 ? {} : { start, end });
+    const body = Readable.toWeb(source) as ReadableStream<Uint8Array>;
+
+    return new NextResponse(body, {
+      status: range ? 206 : 200,
       headers: {
-        "Content-Type": contentType,
-        "Content-Length": String(data.byteLength),
-        "Content-Disposition": contentDisposition(filename, disposition),
-        "X-Content-Type-Options": "nosniff",
+        ...baseHeaders,
+        "Content-Length": String(length),
+        ...(range ? { "Content-Range": `bytes ${start}-${end}/${stat.size}` } : {}),
       },
     });
   }
@@ -916,7 +988,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     };
   }
 
-  async function executeCommand(cmd: string | null, params: ParamBag) {
+  async function executeCommand(
+    cmd: string | null,
+    params: ParamBag,
+    rangeHeader: string | null = null,
+  ) {
     switch (cmd) {
       case "open":
         return handleOpen(params);
@@ -931,7 +1007,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       case "rename":
         return handleRename(params);
       case "file":
-        return handleFile(params);
+        return handleFile(params, rangeHeader);
       case "ls":
         return handleLs(params);
       case "mkfile":
@@ -1109,7 +1185,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     try {
       await ensureUploadDir();
       const params = req.nextUrl.searchParams;
-      return await executeCommand(params.get("cmd"), toParamBagFromSearchParams(params));
+      return await executeCommand(
+        params.get("cmd"),
+        toParamBagFromSearchParams(params),
+        req.headers.get("range"),
+      );
     } catch (error) {
       return toErrorResponse(error);
     }
