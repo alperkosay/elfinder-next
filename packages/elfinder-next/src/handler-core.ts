@@ -2,14 +2,18 @@ import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import { createReadStream } from "fs";
 import { createHash } from "crypto";
+import { AsyncLocalStorage } from "async_hooks";
 import { Readable } from "stream";
 import path from "path";
 import mime from "mime-types";
 import AdmZip from "adm-zip";
 import sharp from "sharp";
 import type { ElfinderContext } from "./context.js";
-import { ElfinderError, toErrorResponse } from "./errors.js";
+import { ElfinderAuthError, ElfinderError, toErrorResponse } from "./errors.js";
 import type { ElfinderFile, ElfinderHandlers } from "./types.js";
+
+/** A permission with every default applied, so callers never re-check for undefined. */
+type ResolvedPermission = { read: boolean; write: boolean; locked: boolean };
 
 // libvips keeps input file handles in its cache; on Windows that blocks unlink (EBUSY).
 sharp.cache({ files: 0 });
@@ -248,6 +252,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     maxArchiveEntries: MAX_ARCHIVE_ENTRIES,
     maxArchiveBytes: MAX_ARCHIVE_BYTES,
     chunkTtlMs: CHUNK_TTL_MS,
+    authorize: AUTHORIZE,
+    permissions: PERMISSIONS,
   } = ctx;
 
   function normalizeRelativePath(raw: string): string {
@@ -374,6 +380,87 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         probe = parent;
       }
     }
+  }
+
+  type RequestScope = {
+    session: unknown;
+    /** Memoizes permission lookups so a listing asks about each path once. */
+    cache: Map<string, ResolvedPermission>;
+  };
+
+  /**
+   * Request-scoped state, carried implicitly rather than threaded through every
+   * internal function.
+   *
+   * Almost everything here needs the session, directly or through a caller:
+   * toFileInfo reports the flags, listDirectory calls toFileInfo, and each handler
+   * checks access. Passing it explicitly would mean an extra parameter on some forty
+   * functions for a value that never changes within a request.
+   */
+  const scopeStorage = new AsyncLocalStorage<RequestScope>();
+
+  const FULL_ACCESS: ResolvedPermission = { read: true, write: true, locked: false };
+
+  /**
+   * Resolves what the caller may do with one path, applying the permissive defaults
+   * for anything the callback leaves out.
+   */
+  async function permissionFor(relativePath: string): Promise<ResolvedPermission> {
+    if (!PERMISSIONS) {
+      return FULL_ACCESS;
+    }
+    const scope = scopeStorage.getStore();
+    const key = normalizeRelativePath(relativePath);
+
+    const cached = scope?.cache.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const granted = await PERMISSIONS(key, scope?.session);
+    const resolved: ResolvedPermission = {
+      read: granted.read ?? true,
+      write: granted.write ?? true,
+      locked: granted.locked ?? false,
+    };
+    scope?.cache.set(key, resolved);
+    return resolved;
+  }
+
+  async function requireRead(relativePath: string): Promise<void> {
+    if (!(await permissionFor(relativePath)).read) {
+      throw new ElfinderError("errAccess");
+    }
+  }
+
+  async function requireWrite(relativePath: string): Promise<void> {
+    if (!(await permissionFor(relativePath)).write) {
+      throw new ElfinderError("errAccess");
+    }
+  }
+
+  /** Parent directory of a path, as permissions and `phash` see it. */
+  function parentOf(relativePath: string): string {
+    const parent = normalizeRelativePath(path.posix.dirname(relativePath));
+    return parent === "." ? "" : parent;
+  }
+
+  /**
+   * Guards renaming or deleting an existing entry.
+   *
+   * Requires `write` on the entry and on the directory holding it, the way a POSIX
+   * unlink does, so revoking `write` on a folder is enough to freeze its contents.
+   * `locked` denies the operation even where `write` is granted.
+   */
+  async function requireMutable(relativePath: string): Promise<void> {
+    const own = await permissionFor(relativePath);
+    if (own.locked) {
+      throw new ElfinderError(["errLocked", path.posix.basename(relativePath)]);
+    }
+    if (!own.write) {
+      throw new ElfinderError("errAccess");
+    }
+    await requireWrite(parentOf(relativePath));
   }
 
   /**
@@ -651,6 +738,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const stat = await fs.stat(absolutePath);
     const isDir = stat.isDirectory();
     const parent = normalizeRelativePath(path.posix.dirname(normalized));
+    const permission = await permissionFor(normalized);
 
     const info: ElfinderFile = {
       name: normalized ? path.posix.basename(normalized) : ROOT_NAME,
@@ -660,9 +748,9 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         ? "directory"
         : detectMimeFromName(path.posix.basename(normalized)),
       ts: Math.floor(stat.mtimeMs / 1000),
-      read: 1,
-      write: 1,
-      locked: 0,
+      read: permission.read ? 1 : 0,
+      write: permission.write ? 1 : 0,
+      locked: permission.locked ? 1 : 0,
       volumeid: VOLUME_ID,
     };
 
@@ -824,6 +912,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         target = "";
       }
     }
+    await requireRead(target);
     const cwd = await toFileInfo(target);
     const children = await listDirectory(target);
     const files = init ? [await toFileInfo(""), ...children] : children;
@@ -841,9 +930,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleTree(params: ParamBag) {
     const target = decodeHash(params.get("target"));
+    await requireRead(target);
     const files = await listDirectory(target);
     return NextResponse.json({
-      tree: files.filter((item) => item.mime === "directory"),
+      tree: files.filter((item) => item.mime === "directory" && item.read === 1),
     });
   }
 
@@ -865,7 +955,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         siblings = [];
       }
       siblings
-        .filter((item) => item.mime === "directory")
+        .filter((item) => item.mime === "directory" && item.read === 1)
         .forEach((item) => tree.set(item.hash, item));
       if (!parent || parent === "." || parent === current) {
         break;
@@ -882,6 +972,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     if (!name) {
       throw new ElfinderError("errInvName");
     }
+    await requireWrite(target);
     const targetRelative = normalizeRelativePath(target ? `${target}/${name}` : name);
     const absolute = await resolveWithinRoot(targetRelative);
     await fs.mkdir(absolute, { recursive: false });
@@ -900,6 +991,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!relative) {
         continue;
       }
+      await requireMutable(relative);
       const absolute = await resolveWithinRoot(relative);
       // Gathered before the delete: once the tree is gone there is no way to know
       // which thumbnails belonged to it.
@@ -926,6 +1018,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
     const parent = normalizeRelativePath(path.posix.dirname(oldRelative));
     const newRelative = normalizeRelativePath(parent ? `${parent}/${name}` : name);
+    await requireMutable(oldRelative);
     const oldAbsolute = await resolveWithinRoot(oldRelative);
     const newAbsolute = await resolveWithinRoot(newRelative);
     await assertNotOccupied(newAbsolute, oldAbsolute);
@@ -948,6 +1041,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errFileNotFound");
     }
 
+    await requireRead(target);
     const absolute = await resolveWithinRoot(target);
     const stat = await fs.stat(absolute);
     if (!stat.isFile()) {
@@ -999,6 +1093,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleLs(params: ParamBag) {
     const target = decodeHash(params.get("target"));
+    await requireRead(target);
     const list = (await listDirectory(target)).map((item) => item.name);
     return NextResponse.json({ list });
   }
@@ -1006,6 +1101,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handleMkfile(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
     const name = (params.get("name") || "newfile.txt").trim();
+    await requireWrite(target);
     const relative = normalizeRelativePath(target ? `${target}/${name}` : name);
     await fs.writeFile(await resolveWithinRoot(relative), "");
     return NextResponse.json({ added: [await toFileInfo(relative)] });
@@ -1016,6 +1112,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     if (!target) {
       throw new ElfinderError("errFileNotFound");
     }
+    await requireRead(target);
     const content = await fs.readFile(await resolveWithinRoot(target), "utf8");
     return NextResponse.json({ content });
   }
@@ -1025,6 +1122,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     if (!target) {
       throw new ElfinderError("errFileNotFound");
     }
+    await requireWrite(target);
     const content = params.get("content") ?? "";
     await fs.writeFile(await resolveWithinRoot(target), content, "utf8");
     return NextResponse.json({ changed: [await toFileInfo(target)] });
@@ -1032,12 +1130,15 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleInfo(params: ParamBag) {
     const targets = getTargets(params);
-    const files = await Promise.all(
-      targets
-        .map((hash) => decodeHash(hash))
-        .filter(Boolean)
-        .map((relative) => toFileInfo(relative)),
-    );
+    const readable: string[] = [];
+    for (const relative of targets.map((hash) => decodeHash(hash)).filter(Boolean)) {
+      // Omitted rather than refused: elFinder asks about a whole selection at once,
+      // and one forbidden item should not blank out the rest.
+      if ((await permissionFor(relative)).read) {
+        readable.push(relative);
+      }
+    }
+    const files = await Promise.all(readable.map((relative) => toFileInfo(relative)));
     return NextResponse.json({ files });
   }
 
@@ -1049,6 +1150,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!sourceRel) {
         continue;
       }
+      await requireRead(sourceRel);
+      await requireWrite(parentOf(sourceRel));
       const sourceAbs = await resolveWithinRoot(sourceRel);
       const ext = path.posix.extname(sourceRel);
       const base = path.posix.basename(sourceRel, ext);
@@ -1067,6 +1170,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handlePaste(params: ParamBag) {
     const dst = requireHash(params.get("dst"), "errTrgFolderNotFound");
+    await requireWrite(dst);
     const cut = isTruthy(params.get("cut"));
     const renames = new Set(params.getAll("renames[]"));
     const suffix = params.get("suffix") || "_copy";
@@ -1080,6 +1184,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const sourceRel = decodeHash(targetHash);
       if (!sourceRel) {
         continue;
+      }
+      await requireRead(sourceRel);
+      if (cut) {
+        await requireMutable(sourceRel);
       }
       const sourceAbs = await resolveWithinRoot(sourceRel);
       const sourceName = path.posix.basename(sourceRel);
@@ -1114,6 +1222,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       return NextResponse.json({ files: [] });
     }
 
+    await requireRead(target);
     const base = await resolveWithinRoot(target);
     const files: ElfinderFile[] = [];
     await walkRecursive(base, async (fullPath) => {
@@ -1133,6 +1242,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!rel) {
         continue;
       }
+      await requireRead(rel);
       const abs = await resolveWithinRoot(rel);
       const st = await fs.stat(abs);
       total += st.size;
@@ -1165,6 +1275,9 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
           continue;
         }
         try {
+          if (!(await permissionFor(relative)).read) {
+            continue;
+          }
           await generate(targetHash, relative);
         } catch {
           // ignore invalid target
@@ -1208,12 +1321,14 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
     const name = (params.get("name") || "archive.zip").trim();
     const archiveRel = normalizeRelativePath(target ? `${target}/${name}` : name);
+    await requireWrite(target);
     const zip = new (AdmZip as unknown as new () => ZipAdapter)();
     for (const targetHash of getTargets(params)) {
       const rel = decodeHash(targetHash);
       if (!rel) {
         continue;
       }
+      await requireRead(rel);
       const abs = await resolveWithinRoot(rel);
       await addPathToZip(zip, abs, path.posix.basename(rel));
     }
@@ -1234,6 +1349,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const outputRel = makedir
       ? normalizeRelativePath(sourceParent ? `${sourceParent}/${sourceBase}` : sourceBase)
       : sourceParent;
+    await requireRead(target);
+    await requireWrite(outputRel);
     const outputAbs = await resolveWithinRoot(outputRel);
 
     // Validate the whole archive before writing a single byte, so a malicious
@@ -1292,12 +1409,14 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const filename = `${parentName}.zip`;
     const zipRel = normalizeRelativePath(parent ? `${parent}/${filename}` : filename);
 
+    await requireWrite(parent);
     const zip = new (AdmZip as unknown as new () => ZipAdapter)();
     for (const targetHash of targets) {
       const rel = decodeHash(targetHash);
       if (!rel) {
         continue;
       }
+      await requireRead(rel);
       await addPathToZip(zip, await resolveWithinRoot(rel), path.posix.basename(rel));
     }
     zip.writeZip(await resolveWithinRoot(zipRel));
@@ -1404,6 +1523,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       formData.get("target") as string | null,
       "errTrgFolderNotFound",
     );
+    await requireWrite(target);
     const uploadTarget = await resolveWithinRoot(target);
     await fs.mkdir(uploadTarget, { recursive: true });
 
@@ -1540,15 +1660,50 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return NextResponse.json({ added });
   }
 
+  /**
+   * Runs the caller's `authorize` hook and returns the session it yields.
+   *
+   * A missing hook leaves the connector open, which is the documented default.
+   * Anything falsy is a denial: a callback that forgets to return a value must not
+   * accidentally grant access. Every failure becomes an ElfinderAuthError, the one
+   * case answered with HTTP 403 rather than the 200 envelope.
+   */
+  async function resolveSession(req: NextRequest): Promise<unknown> {
+    if (!AUTHORIZE) {
+      return undefined;
+    }
+    let session: unknown;
+    try {
+      session = await AUTHORIZE(req);
+    } catch (error) {
+      throw new ElfinderAuthError(
+        error instanceof ElfinderError ? error.payload : "errAccess",
+        { cause: error },
+      );
+    }
+    if (session === null || session === undefined || session === false) {
+      throw new ElfinderAuthError();
+    }
+    return session;
+  }
+
+  /** Establishes the request scope, so permission lookups can find the session. */
+  async function withScope<T>(req: NextRequest, run: () => Promise<T>): Promise<T> {
+    const session = await resolveSession(req);
+    return scopeStorage.run({ session, cache: new Map() }, run);
+  }
+
   async function GET(req: NextRequest) {
     try {
-      await ensureUploadDir();
-      const params = req.nextUrl.searchParams;
-      return await executeCommand(
-        params.get("cmd"),
-        toParamBagFromSearchParams(params),
-        req.headers.get("range"),
-      );
+      return await withScope(req, async () => {
+        await ensureUploadDir();
+        const params = req.nextUrl.searchParams;
+        return await executeCommand(
+          params.get("cmd"),
+          toParamBagFromSearchParams(params),
+          req.headers.get("range"),
+        );
+      });
     } catch (error) {
       return toErrorResponse(error);
     }
@@ -1556,6 +1711,14 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function POST(req: NextRequest) {
     try {
+      return await withScope(req, () => handlePost(req));
+    } catch (error) {
+      return toErrorResponse(error);
+    }
+  }
+
+  async function handlePost(req: NextRequest) {
+    {
       await ensureUploadDir();
       const contentType = req.headers.get("content-type") || "";
       if (contentType.includes("multipart/form-data")) {
@@ -1580,8 +1743,6 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         }
       }
       return await executeCommand(cmd, toParamBagFromSearchParams(params));
-    } catch (error) {
-      return toErrorResponse(error);
     }
   }
 

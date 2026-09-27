@@ -1,3 +1,18 @@
+/**
+ * What the current caller may do with one path.
+ *
+ * Every field is optional; anything omitted takes the permissive default, so a
+ * callback can grant or revoke one thing without restating the rest.
+ */
+export type ElfinderPermission = {
+  /** May be listed, downloaded and previewed. Default: `true` */
+  read?: boolean;
+  /** May be created, modified, moved into or deleted. Default: `true` */
+  write?: boolean;
+  /** Cannot be renamed or deleted, even where `write` is granted. Default: `false` */
+  locked?: boolean;
+};
+
 export type ElfinderFile = {
   name: string;
   size: number;
@@ -5,9 +20,9 @@ export type ElfinderFile = {
   phash?: string;
   mime: string;
   ts: number;
-  read: 1;
-  write: 1;
-  locked: 0;
+  read: 0 | 1;
+  write: 0 | 1;
+  locked: 0 | 1;
   dirs?: 1;
   volumeid: string;
   tmb?: string;
@@ -23,7 +38,7 @@ export type ElfinderFile = {
   };
 };
 
-export type ElfinderOptions = {
+export type ElfinderOptions<Session = unknown> = {
   /** Absolute or cwd-relative path where files are stored. Default: `public/uploads` */
   uploadDir?: string;
   /** Display name for the volume root. Default: `uploads` */
@@ -57,6 +72,53 @@ export type ElfinderOptions = {
    * that nothing else ever revisits. Default: 24 hours
    */
   chunkTtlMs?: number;
+  /**
+   * Decides whether a request may reach the connector at all, and returns whatever
+   * the `permissions` callback needs to know about the caller.
+   *
+   * Returning `null` or `undefined`, or throwing, denies the request with HTTP 403.
+   * A caller who is authenticated but carries no data should return something
+   * truthy such as `true` or `{}` — "no session" is treated as a denial so that a
+   * callback which forgets to return cannot accidentally grant access.
+   *
+   * Omitting this leaves the connector open. Authorization is not optional in
+   * production: without it, anyone who can reach the route can read and write the
+   * whole volume.
+   *
+   * @example
+   * ```ts
+   * authorize: async (request) => {
+   *   const user = await getUser(request);
+   *   return user ? { id: user.id, role: user.role } : null;
+   * }
+   * ```
+   */
+  authorize?: (
+    request: import("next/server").NextRequest,
+  ) => Session | null | undefined | Promise<Session | null | undefined>;
+  /**
+   * Decides what the caller may do with one path, relative to the volume root.
+   * The root itself is `""`.
+   *
+   * Called for each entry in a listing and before each operation, and memoized per
+   * request, so it should be cheap. Each path is asked about independently: to make
+   * a whole subtree read-only, match on the prefix.
+   *
+   * Creating or deleting an entry requires `write` on its parent directory as well,
+   * so denying `write` on a folder is enough to make its contents immutable.
+   *
+   * @example
+   * ```ts
+   * permissions: (relativePath, session) => ({
+   *   write: session.role === "editor" && !relativePath.startsWith("archive/"),
+   *   locked: relativePath === "system",
+   * })
+   * ```
+   */
+  permissions?: (
+    relativePath: string,
+    session: Session,
+  ) => ElfinderPermission | Promise<ElfinderPermission>;
 };
 
 export type ElfinderHandlers = {

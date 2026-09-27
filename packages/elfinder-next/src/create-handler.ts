@@ -16,8 +16,26 @@ import type { ElfinderHandlers, ElfinderOptions } from "./types.js";
  *   tmbUrl: "/uploads/.tmb/",
  * });
  * ```
+ *
+ * @example Authorizing requests, and scoping what each caller may do. The session
+ * type flows from `authorize`'s return type into `permissions`.
+ * ```ts
+ * export const { GET, POST, runtime } = createElfinderHandler({
+ *   uploadDir: "/srv/files",
+ *   authorize: async (request) => {
+ *     const user = await getUser(request);
+ *     return user ? { id: user.id, role: user.role } : null;
+ *   },
+ *   permissions: (relativePath, session) => ({
+ *     write: session.role === "editor",
+ *     locked: relativePath === "system",
+ *   }),
+ * });
+ * ```
  */
-export function createElfinderHandler(options?: ElfinderOptions): ElfinderHandlers {
+export function createElfinderHandler<Session = unknown>(
+  options?: ElfinderOptions<Session>,
+): ElfinderHandlers {
   const ctx = resolveContext(options);
   return createElfinderHandlers(ctx);
 }

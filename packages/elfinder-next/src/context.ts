@@ -1,5 +1,21 @@
 import path from "path";
-import type { ElfinderOptions } from "./types.js";
+import type { ElfinderOptions, ElfinderPermission } from "./types.js";
+
+/**
+ * Internal, session-erased forms of the authorization callbacks.
+ *
+ * The public API is generic over the session type so callers get inference; the
+ * handler does not care what a session is and only passes it back through, so the
+ * generic is dropped at this boundary rather than threaded through every function.
+ */
+export type AuthorizeFn = (
+  request: import("next/server").NextRequest,
+) => unknown | Promise<unknown>;
+
+export type PermissionsFn = (
+  relativePath: string,
+  session: unknown,
+) => ElfinderPermission | Promise<ElfinderPermission>;
 
 export type ElfinderContext = {
   uploadDir: string;
@@ -13,6 +29,8 @@ export type ElfinderContext = {
   maxArchiveEntries: number;
   maxArchiveBytes: number;
   chunkTtlMs: number;
+  authorize: AuthorizeFn | null;
+  permissions: PermissionsFn | null;
 };
 
 /**
@@ -30,7 +48,9 @@ function normalizeUrlPrefix(raw: string): string {
   return raw.endsWith("/") ? raw : `${raw}/`;
 }
 
-export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
+export function resolveContext<Session>(
+  options: ElfinderOptions<Session> = {},
+): ElfinderContext {
   const uploadDir = path.resolve(
     options.uploadDir ?? path.join(process.cwd(), "public", "uploads"),
   );
@@ -50,5 +70,7 @@ export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
     maxArchiveEntries: options.maxArchiveEntries ?? 10_000,
     maxArchiveBytes: options.maxArchiveBytes ?? 1024 * 1024 * 1024,
     chunkTtlMs: options.chunkTtlMs ?? 24 * 60 * 60 * 1000,
+    authorize: (options.authorize as AuthorizeFn | undefined) ?? null,
+    permissions: (options.permissions as PermissionsFn | undefined) ?? null,
   };
 }

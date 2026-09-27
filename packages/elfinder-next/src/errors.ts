@@ -21,6 +21,23 @@ export class ElfinderError extends Error {
   }
 }
 
+/**
+ * A request that failed authorization outright, as opposed to one denied access to
+ * a particular path.
+ *
+ * This one answers HTTP 403 rather than the usual 200 envelope. A rejected session
+ * is an infrastructure event that middleware, proxies and monitoring should be able
+ * to see, and an expired session should be able to trigger a redirect to sign-in
+ * rather than surface as a file-manager error message. Per-path denials stay inside
+ * the 200 envelope, where elFinder can render them.
+ */
+export class ElfinderAuthError extends ElfinderError {
+  constructor(payload: string | string[] = "errAccess", options?: { cause?: unknown }) {
+    super(payload, options);
+    this.name = "ElfinderAuthError";
+  }
+}
+
 /** Maps Node filesystem error codes onto elFinder message keys. */
 const FS_CODE_TO_MESSAGE: Record<string, string> = {
   ENOENT: "errFileNotFound",
@@ -55,6 +72,9 @@ function fsErrorCode(error: unknown): string | null {
  * returned, because Node filesystem messages embed absolute server paths.
  */
 export function toErrorResponse(error: unknown): NextResponse {
+  if (error instanceof ElfinderAuthError) {
+    return NextResponse.json({ error: error.payload }, { status: 403 });
+  }
   if (error instanceof ElfinderError) {
     return NextResponse.json({ error: error.payload });
   }

@@ -142,6 +142,11 @@ export const { GET, POST, runtime } = createElfinderHandler({
 | `volumeId` | `v1_` | Prefix for volume hashes (elFinder `hash` / `phash` encoding). |
 | `publicUrl` | `/uploads/` | Base URL for file previews (must end with `/`; added automatically if omitted). |
 | `tmbUrl` | `/uploads/.tmb/` | Base URL for thumbnail files (must align with files written under `uploadDir/.tmb/`). |
+| `authorize` | none | Gates each request and returns the session. Returning `null` answers HTTP 403. **Omitting it leaves the volume open.** See [Authorization](#authorization). |
+| `permissions` | none | Per-path `read` / `write` / `locked`, given the session. Omitted flags stay permissive. |
+| `maxArchiveEntries` | `10000` | Largest entry count `extract` will unpack. |
+| `maxArchiveBytes` | 1 GiB | Largest total uncompressed size `extract` will unpack. |
+| `chunkTtlMs` | 24 hours | How long an abandoned chunked upload's parts survive before being swept. |
 
 ### TypeScript exports
 
@@ -218,16 +223,64 @@ Unknown commands return `400` with `{ error: "Command not implemented: …" }`.
 
 ---
 
-## Security considerations
+## Authorization
 
-**v0.1.0 is intended for trusted or development environments.** Before exposing a volume in production:
+**Without an `authorize` hook the connector is open**: anyone who can reach the route can read and write the whole volume. Nothing else in the package makes that decision for you.
 
-- **Authenticate** requests in middleware or wrap the route so only authorized users reach the connector.
-- **Scope** `uploadDir` to a dedicated directory; never point it at project root or sensitive paths.
+### Gating the request
+
+`authorize` runs once per request, before any command. Return anything truthy to allow it, and `null` to refuse. Refusal answers **HTTP 403**, so proxies and monitoring can see it and the app can redirect an expired session to sign-in.
+
+```ts
+export const { GET, POST, runtime } = createElfinderHandler({
+  uploadDir: "/srv/files",
+  authorize: async (request) => {
+    const user = await getUser(request);
+    return user ? { id: user.id, role: user.role } : null;
+  },
+});
+```
+
+A callback that forgets to return a value denies the request. That is deliberate: the failure mode of a mistake should be a locked door.
+
+### Scoping what a caller may do
+
+`permissions` is asked about one path at a time, relative to the volume root, with the session `authorize` returned. Whatever it omits stays permissive.
+
+```ts
+createElfinderHandler({
+  uploadDir: "/srv/files",
+  authorize: async (request) => (await getUser(request)) ?? null,
+  permissions: (relativePath, session) => ({
+    read: !relativePath.startsWith("private/"),
+    write: session.role === "editor",
+    locked: relativePath === "system",
+  }),
+});
+```
+
+| Flag | Denying it refuses | Default |
+|------|--------------------|---------|
+| `read` | `open`, `ls`, `tree`, `get`, `file`, `search`, `size`, and use as a copy source | `true` |
+| `write` | `mkdir`, `mkfile`, `put`, `upload`, `paste` into it, `duplicate`, `archive`, `extract` | `true` |
+| `locked` | `rm`, `rename` and moving the entry, even where `write` is granted | `false` |
+
+Two behaviours are worth knowing:
+
+- **Creating or deleting an entry also needs `write` on its parent directory**, the way a POSIX unlink does. Revoking `write` on one folder is therefore enough to freeze everything inside it, without enumerating the contents.
+- **Each path is asked about independently.** There is no inheritance, so match on the prefix to cover a subtree.
+
+The result is memoized per request, so a listing asks about each path once. Denials inside a command come back as `errAccess` in a **200** response, where elFinder renders them; only a failed `authorize` produces a 403.
+
+Every entry also carries its flags in the listing, so the client greys out what it cannot use rather than offering an action that will fail.
+
+### Still your responsibility
+
+- **Scope** `uploadDir` to a dedicated directory; never point it at the project root.
 - **Review** elFinder client options (allowed MIME types, max upload size) on the frontend.
 - **Rate-limit** upload and archive endpoints if exposed publicly.
 
-Path traversal is mitigated by resolving all paths under `uploadDir`, but authorization is your responsibility.
+Path traversal, symlink escape and archive-extraction limits are handled by the package.
 
 ---
 
