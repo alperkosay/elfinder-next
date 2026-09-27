@@ -304,7 +304,7 @@ Uygulama ile istemciye bildirilen yetenekler birkaç yerde çelişiyor.
 - [x] **26. Sırasız chunk yarışı** — `isLastChunk` yalnızca `start + size >= total` bakıyor. Parçalar paralel gönderildiği için en son offset'li parça diğerlerinden önce varırsa birleştirme eksik parçalarla başlıyor ve dosya kırpılıyor. Gelen parça sayısını veya toplam baytı saymak gerekiyor.
 - [x] **27. `open` içinde `tree=1` yok sayılıyor** — elFinder `cmd=open&init=1&tree=1` gönderiyor. Bu durumda connector'ın ağaç klasörlerini de `files` içinde döndürmesi bekleniyor. Sol paneldeki ağaç eksik kalabilir.
 - [x] **28. `uplMaxSize` ve `uplMaxFile`** — `open` yanıtında yok, istemci yükleme boyutunu önceden doğrulayamıyor.
-- [x] **29. `mkdir` / `mkfile` EEXIST** — var olan ad için 500 fırlatıyor, `errExists` döndürmeli.
+- [x] **29. `mkdir` / `mkfile` EEXIST** — var olan ad için 500 fırlatıyor, `errExists` döndürmeli. — `mkdir` kısmı madde 5'teki hata eşlemesiyle kapanmıştı, `mkfile` kısmı değil: hata fırlatmadan var olan dosyayı sıfır bayta indiriyordu. `fix/small-fixes` dalında, madde 37 ile birlikte `wx` bayrağıyla tamamlandı.
 - [x] **30. `handleGet` sadece utf8** — ikili dosyada bozuk içerik dönüyor, `conv` parametresi desteklenmiyor.
 
 ---
