@@ -2,8 +2,8 @@
 
 A monorepo for **[elfinder-next](packages/elfinder-next)** — an npm package that brings the [elFinder](https://github.com/Studio-42/elFinder) 2.1 connector protocol to **Next.js App Router** API routes.
 
-> **Status: v0.1.0 — first release.**  
-> The published package and this repository are in their initial version. Feature set and configuration options are stable enough for adoption, but breaking changes may occur before v1.0.0. See the [package README](packages/elfinder-next/README.md) for full usage documentation.
+> **Status: v0.2.0.**  
+> 0.2.0 moved uploads out of `public/`; see the package README for the upgrade notes. Feature set and configuration options are stable enough for adoption, but breaking changes may occur before v1.0.0. See the [package README](packages/elfinder-next/README.md) for full usage documentation.
 
 ---
 
@@ -104,7 +104,7 @@ import { createElfinderHandler } from "elfinder-next";
 export const { GET, POST, runtime } = createElfinderHandler();
 ```
 
-Uploads are written to `apps/playground/public/uploads/` by default.
+Uploads are written to `apps/playground/uploads/` by default, and served through the connector.
 
 ---
 
@@ -123,7 +123,7 @@ Uploads are written to `apps/playground/public/uploads/` by default.
 | | |
 |---|---|
 | **npm name** | `elfinder-next` |
-| **Version** | `0.1.0` (initial release) |
+| **Version** | `0.2.0` |
 | **Peer dependency** | `next` >= 14 |
 | **Runtime** | Node.js only (`runtime: "nodejs"`) |
 | **License** | MIT |
@@ -132,11 +132,11 @@ Uploads are written to `apps/playground/public/uploads/` by default.
 
 ## Roadmap (informal)
 
-Planned or possible improvements after v0.1.0:
+Planned or possible improvements:
 
 - Image `resize` command
-- Optional authentication hooks
-- Additional archive formats or cloud volume adapters
+- Storage adapters (S3 and similar), which serverless hosting needs
+- Additional archive formats
 - Stable v1.0 API surface
 
 Contributions and issue reports are welcome as the project matures toward v1.0.0.

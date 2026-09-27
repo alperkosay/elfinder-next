@@ -1,6 +1,6 @@
 {
   "name": "elfinder-next",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "elFinder 2.1 connector for Next.js App Router API routes",
   "type": "module",
   "main": "./dist/index.js",

@@ -5,8 +5,9 @@
 [![npm version](https://img.shields.io/npm/v/elfinder-next.svg)](https://www.npmjs.com/package/elfinder-next)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> **v0.1.0 — First public release.**  
-> This is the initial version of the package. APIs and defaults may evolve in future releases; pin your version in production and review release notes when upgrading.
+> **v0.2.0 changes the storage defaults.** Files now live outside `public/` and are
+> served through the connector. See [Upgrading from 0.1.x](#upgrading-from-01x).
+> APIs may still change before 1.0; pin your version in production.
 
 ---
 
@@ -30,7 +31,7 @@
 
 - A **Next.js** application with the App Router
 - An **elFinder frontend** (jQuery elFinder or a wrapper) pointed at your API route URL
-- Files under `public/` (or equivalent static hosting) so `publicUrl` and `tmbUrl` paths are reachable by the browser
+- A **persistent, writable directory** on the server for the files. See [Deployment](#deployment) before picking a host.
 
 The package is **backend-only**. It does not bundle the elFinder UI.
 
@@ -85,22 +86,29 @@ export default nextConfig;
 // app/api/elfinder/route.ts
 import { createElfinderHandler } from "elfinder-next";
 
-export const { GET, POST, runtime } = createElfinderHandler();
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const { GET, POST } = createElfinderHandler();
 ```
+
+`runtime` and `dynamic` are written as plain values on purpose. Next reads route
+segment config statically, and it cannot see a value destructured from a function
+call. `nodejs` is the default runtime today, so re-exporting `runtime` from the
+handler happens to work, but only by coincidence.
 
 Defaults:
 
-- Files are stored in `<project>/public/uploads`
-- Public URLs use `/uploads/` and `/uploads/.tmb/`
+- Files are stored in `<cwd>/uploads`, outside `public/`
+- Previews and thumbnails are served by the connector (`cmd=file`), so they work
+  the moment a file is uploaded
 
-### 2. Ensure the upload directory exists
+### 2. Keep uploads out of version control
 
-The handler creates `uploads`, `.tmb`, and `.chunks` on first request. For version control, you may add an empty folder:
+The handler creates the directory, plus `.tmb`, `.chunks` and `.tmp` inside it, on
+the first request. Add it to `.gitignore`:
 
 ```
-public/
-  uploads/
-    .gitkeep
+/uploads
 ```
 
 ### 3. Connect the elFinder frontend
@@ -114,8 +122,6 @@ $("#elfinder").elfinder({
 });
 ```
 
-Previews and thumbnails require that `publicUrl` and `tmbUrl` match paths actually served from `public/` (or your CDN).
-
 ---
 
 ## Configuration
@@ -123,25 +129,22 @@ Previews and thumbnails require that `publicUrl` and `tmbUrl` match paths actual
 Pass an optional options object to `createElfinderHandler`:
 
 ```ts
-import path from "path";
 import { createElfinderHandler } from "elfinder-next";
 
-export const { GET, POST, runtime } = createElfinderHandler({
-  uploadDir: path.join(process.cwd(), "public", "media"),
+export const { GET, POST } = createElfinderHandler({
+  uploadDir: process.env.ELFINDER_DIR, // e.g. /srv/files
   rootName: "media",
   volumeId: "v1_",
-  publicUrl: "/media/",
-  tmbUrl: "/media/.tmb/",
 });
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `uploadDir` | `public/uploads` (resolved from `process.cwd()`) | Absolute or relative filesystem root for the volume. All paths are confined under this directory. |
+| `uploadDir` | `uploads` (resolved from `process.cwd()`) | Filesystem root for the volume. All paths are confined under it. **Use an absolute path in production**; see [Deployment](#deployment). |
 | `rootName` | `uploads` | Display name of the volume root in elFinder. |
 | `volumeId` | `v1_` | Prefix for volume hashes (elFinder `hash` / `phash` encoding). |
-| `publicUrl` | `/uploads/` | Base URL for file previews (must end with `/`; added automatically if omitted). |
-| `tmbUrl` | `/uploads/.tmb/` | Base URL for thumbnail files (must align with files written under `uploadDir/.tmb/`). |
+| `publicUrl` | `""` | Static URL prefix for files. Empty means the connector serves them. Set it only when something other than Next's `public/` serves `uploadDir`, such as a CDN or reverse proxy. A trailing `/` is added if missing. |
+| `tmbUrl` | `""` | Static URL prefix for `uploadDir/.tmb/`. Empty means the connector serves thumbnails. Same caveat as `publicUrl`. |
 | `authorize` | none | Gates each request and returns the session. Returning `null` answers HTTP 403. **Omitting it leaves the volume open.** See [Authorization](#authorization). |
 | `permissions` | none | Per-path `read` / `write` / `locked`, given the session. Omitted flags stay permissive. |
 | `maxArchiveEntries` | `10000` | Largest entry count `extract` will unpack. |
@@ -158,6 +161,102 @@ import {
   type ElfinderFile,
 } from "elfinder-next";
 ```
+
+---
+
+## Deployment
+
+The connector reads and writes a real directory. Wherever you deploy, that
+directory has to be **writable at runtime** and **survive a redeploy**.
+
+| Target | Works? | What you need |
+|--------|--------|---------------|
+| `next start` on a VM or bare server | Yes | An absolute `uploadDir` outside the project, e.g. `/srv/files` |
+| Docker, including `output: "standalone"` | Yes | A mounted volume as `uploadDir`, plus the settings below |
+| Vercel, Netlify and other serverless hosts | **No** | The runtime filesystem is read-only and discarded between invocations. There is no storage adapter for S3 or similar yet. |
+
+### Why not `public/`
+
+Next's production server reads the list of files in `public/` once, at startup.
+A file added afterwards answers **404 until the server restarts**. Measured on
+Next 16.2.6: a file uploaded through the connector under `next start` 404s at
+`/uploads/<name>` and answers 200 after a restart.
+
+`public/` is also copied at build time, not read at runtime, so on serverless hosts
+and in standalone builds a runtime upload never reaches it at all. That is why the
+defaults keep files out of `public/` and serve them through the connector.
+
+If you do serve `uploadDir` statically, use something that reads the disk on every
+request, such as nginx or a CDN with an origin, and set `publicUrl` and `tmbUrl` to
+its prefixes.
+
+### `output: "standalone"`
+
+Three things go wrong with the defaults:
+
+1. **Uploads land inside the build output.** The generated `server.js` changes the
+   working directory to `.next/standalone`, so a relative `uploadDir` resolves
+   there. The handler creates the directory itself, so nothing fails; everything
+   uploaded is silently deleted by the next build or the next image.
+2. **Packages outside the app are not traced.** In a monorepo, Next traces files
+   from the app's own directory unless told otherwise, and `sharp`'s native binary
+   is a known casualty.
+3. **`public/` is not copied** into the standalone output. This no longer matters
+   for uploads, but applies to your own static files as usual.
+
+```ts
+// next.config.ts
+import path from "node:path";
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  output: "standalone",
+  serverExternalPackages: ["sharp", "adm-zip"],
+  // Monorepos only: the repository root, so packages outside the app are traced.
+  outputFileTracingRoot: path.join(__dirname, "../../"),
+  outputFileTracingIncludes: { "/api/elfinder": ["node_modules/sharp/**/*"] },
+};
+
+export default nextConfig;
+```
+
+```ts
+// app/api/elfinder/route.ts
+export const { GET, POST } = createElfinderHandler({
+  uploadDir: process.env.ELFINDER_DIR, // absolute path on a mounted volume
+});
+```
+
+---
+
+## Upgrading from 0.1.x
+
+0.2.0 changes three defaults:
+
+| Option | 0.1.x | 0.2.0 |
+|--------|-------|-------|
+| `uploadDir` | `<cwd>/public/uploads` | `<cwd>/uploads` |
+| `publicUrl` | `/uploads/` | `""` (served by the connector) |
+| `tmbUrl` | `/uploads/.tmb/` | `""` (served by the connector) |
+
+The old defaults never showed previews under `next start` (see
+[Why not `public/`](#why-not-public)), and they exposed half-finished chunked
+uploads at `/uploads/.chunks/`.
+
+If you relied on the defaults, either move `public/uploads` to `uploads`, or pin
+the old location while you migrate:
+
+```ts
+createElfinderHandler({
+  uploadDir: "public/uploads",
+  publicUrl: "",  // keep serving through the connector
+  tmbUrl: "",
+});
+```
+
+With an empty `tmbUrl`, a thumbnail's `tmb` field is now a connector URL
+(`?cmd=file&target=<hash>&thumb=1`) rather than a filename. Code that read `tmb`
+as a filename should use a non-empty `tmbUrl`, which keeps the old shape.
 
 ---
 
@@ -188,7 +287,7 @@ import {
 2. The handler validates paths stay inside `uploadDir` (path traversal protection).
 3. Responses follow the elFinder 2.1 JSON shape (`cwd`, `files`, `added`, `error`, …).
 
-Static assets under `public/` are served by Next.js; the connector only manages the filesystem and JSON protocol.
+File contents and thumbnails are streamed by the connector itself (`cmd=file`, with HTTP Range support), unless `publicUrl` / `tmbUrl` point the client at a static host.
 
 ---
 
@@ -217,9 +316,9 @@ Static assets under `public/` are served by Next.js; the connector only manages 
 | `zipdl` | GET/POST | Create ZIP for download workflow |
 | `dim` | GET | Returns `unknown` (placeholder) |
 | `upload` | POST | Multipart upload; supports chunked uploads |
-| `resize` | — | **Not implemented** (returns 400) |
+| `resize` | — | **Not implemented** (returns `errCmdNoSupport`) |
 
-Unknown commands return `400` with `{ error: "Command not implemented: …" }`.
+Unknown commands return `{ "error": ["errUnknownCmd"] }`.
 
 ---
 
@@ -286,27 +385,28 @@ Path traversal, symlink escape and archive-extraction limits are handled by the 
 
 ## Error handling
 
-Errors are returned as JSON:
+Command errors come back with **HTTP 200** and elFinder message keys, which the
+client translates:
 
 ```json
-{ "error": "Access denied" }
+{ "error": ["errExists", "photo.jpg"] }
 ```
 
-| HTTP status | Typical cause |
-|-------------|----------------|
-| `403` | Path escapes `uploadDir` |
-| `400` | Invalid command, target, or arguments |
-| `500` | Unexpected filesystem or processing error |
+A non-2xx response would make elFinder report a connection failure and discard the
+body. Raw filesystem errors are logged on the server and returned as `errUnknown`
+or a mapped key, so absolute server paths never reach the client.
+
+The one exception is a request refused by `authorize`, which answers **HTTP 403**.
 
 ---
 
-## Limitations (v0.1.0)
+## Limitations
 
 - Single local volume per handler instance
 - No `resize` command
-- No cloud storage backends (S3, etc.)
+- No cloud storage backends (S3, etc.), so no serverless deployment
 - Archivers limited to ZIP via `adm-zip`
-- `chmod`, `netmount`, and volume `size` are disabled on the root options object
+- `chmod` and `netmount` are disabled
 
 These may be addressed in later versions.
 
