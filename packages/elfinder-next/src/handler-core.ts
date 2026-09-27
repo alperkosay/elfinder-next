@@ -36,8 +36,6 @@ function formatByteSize(bytes: number): string {
 /** A permission with every default applied, so callers never re-check for undefined. */
 type ResolvedPermission = { read: boolean; write: boolean; locked: boolean };
 
-// libvips keeps input file handles in its cache; on Windows that blocks unlink (EBUSY).
-sharp.cache({ files: 0 });
 
 type ParamBag = {
   get: (key: string) => string | null;
