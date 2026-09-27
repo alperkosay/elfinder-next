@@ -24,11 +24,15 @@ export type ElfinderContext = {
   rootHash: string;
   tmbDir: string;
   chunkDir: string;
+  tmpDir: string;
   publicUrl: string;
   tmbUrl: string;
   maxArchiveEntries: number;
   maxArchiveBytes: number;
   chunkTtlMs: number;
+  maxUploadBytes: number;
+  maxUploadFiles: number;
+  maxSearchResults: number;
   authorize: AuthorizeFn | null;
   permissions: PermissionsFn | null;
 };
@@ -51,12 +55,13 @@ function normalizeUrlPrefix(raw: string): string {
 export function resolveContext<Session>(
   options: ElfinderOptions<Session> = {},
 ): ElfinderContext {
-  const uploadDir = path.resolve(
-    options.uploadDir ?? path.join(process.cwd(), "public", "uploads"),
-  );
+  // Outside public/ and with no URL prefixes by default, so every file and thumbnail
+  // goes through the connector. Next's production server snapshots public/ at
+  // startup, so anything uploaded there later answers 404 until a restart.
+  const uploadDir = path.resolve(options.uploadDir ?? path.join(process.cwd(), "uploads"));
   const volumeId = options.volumeId ?? "v1_";
-  const publicUrl = options.publicUrl ?? "/uploads/";
-  const tmbUrl = options.tmbUrl ?? "/uploads/.tmb/";
+  const publicUrl = options.publicUrl ?? "";
+  const tmbUrl = options.tmbUrl ?? "";
 
   return {
     uploadDir,
@@ -65,11 +70,15 @@ export function resolveContext<Session>(
     rootHash: `${volumeId}Lw`,
     tmbDir: path.resolve(uploadDir, ".tmb"),
     chunkDir: path.resolve(uploadDir, ".chunks"),
+    tmpDir: path.resolve(uploadDir, ".tmp"),
     publicUrl: normalizeUrlPrefix(publicUrl),
     tmbUrl: normalizeUrlPrefix(tmbUrl),
     maxArchiveEntries: options.maxArchiveEntries ?? 10_000,
     maxArchiveBytes: options.maxArchiveBytes ?? 1024 * 1024 * 1024,
     chunkTtlMs: options.chunkTtlMs ?? 24 * 60 * 60 * 1000,
+    maxUploadBytes: options.maxUploadBytes ?? 256 * 1024 * 1024,
+    maxUploadFiles: options.maxUploadFiles ?? 20,
+    maxSearchResults: options.maxSearchResults ?? 500,
     authorize: (options.authorize as AuthorizeFn | undefined) ?? null,
     permissions: (options.permissions as PermissionsFn | undefined) ?? null,
   };

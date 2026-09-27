@@ -10,5 +10,5 @@ dist
 *.tsbuildinfo
 **/*.tsbuildinfo
 
+apps/playground/uploads
 apps/playground/public/uploads
-apps/playground/public/elfinder

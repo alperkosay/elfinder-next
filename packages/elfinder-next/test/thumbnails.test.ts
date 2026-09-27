@@ -1,7 +1,9 @@
+import { NextRequest } from "next/server";
 import fs from "node:fs/promises";
 import path from "node:path";
 import sharp from "sharp";
 import { beforeAll, describe, expect, it } from "vitest";
+import { createElfinderHandler } from "../src/index.js";
 import { ROOT_HASH, hashOf, json, makeVolume } from "./helpers.js";
 
 let png: Buffer;
@@ -13,6 +15,13 @@ beforeAll(async () => {
     .png()
     .toBuffer();
 });
+
+/**
+ * A static thumbnail prefix, under which `tmb` carries the bare filename. Used by the
+ * tests that inspect the naming scheme; the default mode wraps the name in a
+ * connector URL instead.
+ */
+const STATIC = { tmbUrl: "/uploads/.tmb/" };
 
 /** Number of files sitting in the volume's thumbnail directory. */
 async function thumbCount(uploadDir: string): Promise<number> {
@@ -61,7 +70,7 @@ describe("cmd=tmb generates thumbnails on demand (item 9)", () => {
   });
 
   it("reports the generated thumbnail on the next listing", async () => {
-    const vol = await makeVolume({ "a.png": png, "b.png": png });
+    const vol = await makeVolume({ "a.png": png, "b.png": png }, STATIC);
     await vol.GET(`cmd=tmb&targets[]=${hashOf("a.png")}`);
 
     const body = await json(await vol.GET(`cmd=open&target=${ROOT_HASH}`));
@@ -72,7 +81,7 @@ describe("cmd=tmb generates thumbnails on demand (item 9)", () => {
   });
 
   it("produces a thumbnail no larger than 48px on its longest side", async () => {
-    const vol = await makeVolume({ "a.png": png });
+    const vol = await makeVolume({ "a.png": png }, STATIC);
     const body = await json(await vol.GET(`cmd=tmb&targets[]=${hashOf("a.png")}`));
     const thumbName = body.images[hashOf("a.png")];
 
@@ -81,7 +90,7 @@ describe("cmd=tmb generates thumbnails on demand (item 9)", () => {
   });
 
   it("reuses an existing thumbnail rather than rewriting it", async () => {
-    const vol = await makeVolume({ "a.png": png });
+    const vol = await makeVolume({ "a.png": png }, STATIC);
     const target = hashOf("a.png");
     const first = await json(await vol.GET(`cmd=tmb&targets[]=${target}`));
     const thumbPath = path.join(vol.uploadDir, ".tmb", first.images[target]);
@@ -102,9 +111,73 @@ describe("cmd=tmb generates thumbnails on demand (item 9)", () => {
   });
 });
 
+describe("thumbnails without a tmbUrl are served by the connector (item 44)", () => {
+  /** The query string of a connector URL, in the form `vol.GET` takes. */
+  const queryOf = (url: string) => url.slice(url.indexOf("?") + 1);
+
+  it("hands out a connector URL that serves the thumbnail", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    const target = hashOf("a.png");
+    const body = await json(await vol.GET(`cmd=tmb&targets[]=${target}`));
+    const url: string = body.images[target];
+
+    // The 2.1 client uses tmb verbatim when tmbUrl is empty, so a bare filename
+    // would resolve against the page and 404.
+    expect(url).toBe(`/api/elfinder?cmd=file&target=${target}&thumb=1`);
+
+    const response = await vol.GET(queryOf(url));
+    expect(response.headers.get("content-type")).toBe("image/png");
+    const meta = await sharp(Buffer.from(await response.arrayBuffer())).metadata();
+    expect(Math.max(meta.width ?? 0, meta.height ?? 0)).toBeLessThanOrEqual(48);
+  });
+
+  it("reports the same URL on the next listing", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    const target = hashOf("a.png");
+    const generated = (await json(await vol.GET(`cmd=tmb&targets[]=${target}`))).images[target];
+
+    const body = await json(await vol.GET(`cmd=open&target=${ROOT_HASH}`));
+    expect(body.files.find((f: any) => f.name === "a.png").tmb).toBe(generated);
+  });
+
+  it("includes the basePath", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    const handlers = createElfinderHandler({ uploadDir: vol.uploadDir });
+    const request = new NextRequest(
+      `http://localhost/app/api/elfinder?cmd=tmb&targets[]=${hashOf("a.png")}`,
+      { nextConfig: { basePath: "/app" } },
+    );
+
+    const body = await json((await handlers.GET(request)) as unknown as Response);
+    expect(body.images[hashOf("a.png")]).toMatch(/^\/app\/api\/elfinder\?/);
+  });
+
+  it("gates the thumbnail on read access to the source", async () => {
+    let denied = false;
+    const vol = await makeVolume(
+      { "a.png": png },
+      { permissions: (p) => ({ read: !(denied && p === "a.png") }) },
+    );
+    const target = hashOf("a.png");
+    const url = (await json(await vol.GET(`cmd=tmb&targets[]=${target}`))).images[target];
+
+    denied = true;
+    expect(await json(await vol.GET(queryOf(url)))).toEqual({ error: ["errAccess"] });
+  });
+
+  it("does not generate a thumbnail when asked for one that does not exist", async () => {
+    // Generation belongs to cmd=tmb; a plain GET should not be a way to run sharp.
+    const vol = await makeVolume({ "a.png": png });
+    const response = await vol.GET(`cmd=file&target=${hashOf("a.png")}&thumb=1`);
+
+    expect(await json(response)).toEqual({ error: ["errFileNotFound"] });
+    expect(await thumbCount(vol.uploadDir)).toBe(0);
+  });
+});
+
 describe("a replaced file gets a fresh thumbnail (item 10)", () => {
   it("changes the thumbnail name when the source contents change", async () => {
-    const vol = await makeVolume({ "a.png": png });
+    const vol = await makeVolume({ "a.png": png }, STATIC);
     const target = hashOf("a.png");
 
     const first = (await json(await vol.GET(`cmd=tmb&targets[]=${target}`))).images[target];
@@ -159,7 +232,7 @@ describe("a replaced file gets a fresh thumbnail (item 10)", () => {
     // The old scheme embedded the base64 path, which grows without bound and can
     // overrun the 255-byte filename limit.
     const deep = Array.from({ length: 20 }, (_, i) => `level-${i}-with-a-longish-name`).join("/");
-    const vol = await makeVolume({ [`${deep}/a.png`]: png });
+    const vol = await makeVolume({ [`${deep}/a.png`]: png }, STATIC);
     const target = hashOf(`${deep}/a.png`);
 
     const body = await json(await vol.GET(`cmd=tmb&targets[]=${target}`));

@@ -26,6 +26,13 @@ Tamamlanan maddeler (`fix/security-and-core-hardening` ve `fix/thumbnail-lifecyc
 | 60 | Node desteği 20.3+ olarak daraltıldı |
 | 10, 11, 13 | Thumbnail parmak izi, temizlik ve chunk toplayıcı |
 | 14 | Auth ve yol başına izin kancaları |
+| 15-19, 21-30 | Protokol uyumu (zipdl iki faz, chunk birleştirme, boyut, arama, options) |
+| 38, 42-45 | Varsayılanlar `public/` dışına alındı, connector üzerinden servis, dağıtım belgeleri (`docs/deployment`) |
+| 56 | README sürüm bilgisi (0.2.0) |
+| 50, 53-55, 57, 58 | Temiz klonda playground, LICENSE, npm metadata, Next 14/15 CI işi (`chore/repo-hygiene`) |
+| 59 | Karara bağlandı: CJS yok, `sideEffects: false` 35 ile eklendi |
+| 61 | Ölçüldü: yalnızca workspace bağlantısında, `outputFileTracingExcludes` belgelendi |
+| 34-37, 39-41 | Küçük düzeltmeler, 37 bir izin atlatması çıktı (`fix/small-fixes`) |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -35,15 +42,14 @@ oluyor.
 Komutlar:
 
 ```bash
-pnpm test        # vitest, 146 test
+pnpm test        # vitest, 227 test
 pnpm typecheck   # kaynak + testler
 ```
 
-**Açıkta kalan:** madde 15-19 ve 21-30 (protokol),
-31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen ve npm metadata).
+**Açıkta kalan:** madde 32, 33 (mimari), 12'nin toplam kota kısmı, 61'in kozmetik
+uyarısı (32 ile birlikte).
 
-Sıradaki en büyük blok protokol uyumu (15-19, 21-30): on altı madde, çoğu beş ila
-yirmi satır.
+Sıradaki blok: StorageAdapter soyutlaması (32), ardından tembel bağımlılıklar (33).
 
 ---
 
@@ -250,8 +256,8 @@ Yalnızca silinen hedefin thumbnail'i siliniyor. İçinde 100 görsel olan bir k
 
 - [x] `Readable.toWeb` ile akış döndür
 - [x] HTTP Range desteği ekle. Range olmadan video ve ses önizlemesinde ileri sarma çalışmıyor.
-- [ ] Birleştirmeyi `createWriteStream` ile akışa çevir
-- [ ] `maxFileSize`, `maxFiles` ve toplam kota seçenekleri ekle
+- [x] Birleştirmeyi `createWriteStream` ile akışa çevir — `mergeChunks` bunu protokol dalında zaten yapıyordu, kutu işaretlenmemiş kalmıştı
+- [ ] `maxFileSize`, `maxFiles` ve toplam kota seçenekleri ekle — ilk ikisi `maxUploadBytes` ve `maxUploadFiles` olarak var, toplam kota yok
 
 > Gerçek akışlı **yükleme** bu listede yok. `req.formData()` Node runtime'da gövdenin
 > tamamını zaten belleğe alıyor. Onu aşmak busboy gibi kendi multipart ayrıştırıcınızı
@@ -298,7 +304,7 @@ Uygulama ile istemciye bildirilen yetenekler birkaç yerde çelişiyor.
 - [x] **26. Sırasız chunk yarışı** — `isLastChunk` yalnızca `start + size >= total` bakıyor. Parçalar paralel gönderildiği için en son offset'li parça diğerlerinden önce varırsa birleştirme eksik parçalarla başlıyor ve dosya kırpılıyor. Gelen parça sayısını veya toplam baytı saymak gerekiyor.
 - [x] **27. `open` içinde `tree=1` yok sayılıyor** — elFinder `cmd=open&init=1&tree=1` gönderiyor. Bu durumda connector'ın ağaç klasörlerini de `files` içinde döndürmesi bekleniyor. Sol paneldeki ağaç eksik kalabilir.
 - [x] **28. `uplMaxSize` ve `uplMaxFile`** — `open` yanıtında yok, istemci yükleme boyutunu önceden doğrulayamıyor.
-- [x] **29. `mkdir` / `mkfile` EEXIST** — var olan ad için 500 fırlatıyor, `errExists` döndürmeli.
+- [x] **29. `mkdir` / `mkfile` EEXIST** — var olan ad için 500 fırlatıyor, `errExists` döndürmeli. — `mkdir` kısmı madde 5'teki hata eşlemesiyle kapanmıştı, `mkfile` kısmı değil: hata fırlatmadan var olan dosyayı sıfır bayta indiriyordu. `fix/small-fixes` dalında, madde 37 ile birlikte `wx` bayrağıyla tamamlandı.
 - [x] **30. `handleGet` sadece utf8** — ikili dosyada bozuk içerik dönüyor, `conv` parametresi desteklenmiyor.
 
 ---
@@ -336,29 +342,32 @@ Yaklaşık 30 MB native ikili, bazı serverless platformlarda sorun çıkarıyor
 
 ## P3 — Küçük ama hızlı kazançlar
 
-- [ ] **34.** `dim` ve `resize` komutlarını yaz. sharp zaten bağımlı, ikisi de yaklaşık 20 satır. Şu an "desteklenmiyor" diye duruyorlar.
-- [ ] **35. `handler-core.ts:11`** — `sharp.cache` ayarı modül yüklenirken global değiştiriliyor. Ana uygulamanın sharp davranışını da etkiliyor. En azından belgele, mümkünse kapsamla.
-- [ ] **36.** `ensureUploadDir()` her istekte üç `mkdir` çağırıyor. Sonucu bir promise'te önbellekle.
-- [ ] **37.** `mkdir`, `mkfile` ve `rename` gelen adda `/` veya `\` kontrolü yapmıyor. Kök dışına çıkamıyor ama dosyayı beklenmedik klasöre taşıyabiliyor.
-- [ ] **38. `.chunks` dizini `public/` altında.** Yarım kalan yüklemelerin içeriği `/uploads/.chunks/...` adresinden herkese açık. Chunk ve tmb dizinlerini servis edilen kökün dışına taşı.
-- [ ] **39. `looksLikeElfinderHash`** — `/^v\d+_/` kalıbını sabit kodluyor. Özel bir `volumeId` verilirse yükleme dosya adı sezgiseli bozuluyor. `VOLUME_ID` değişkenini kullan.
-- [ ] **40.** `detectMimeFromName` içindeki `.pdf` dalı ölü kod, `mime-types` zaten biliyor.
-- [ ] **41.** Thumbnail ve dosya yanıtlarına `Cache-Control` ekle.
+- [x] **34.** `dim` ve `resize` komutlarını yaz. sharp zaten bağımlı, ikisi de yaklaşık 20 satır. Şu an "desteklenmiyor" diye duruyorlar. — YAPILDI. İstek biçimi istemcinin `resize.js` dosyasından alındı: `resize`, `crop`, `rotate`, JPEG kalitesi, `bg`. Sonuç `.tmp`'de hazırlanıp orijinalin üzerine taşınıyor, kenar 10000 px ile sınırlı. 20 satırdan uzun sürdü.
+- [x] **35. `handler-core.ts:11`** — `sharp.cache` ayarı modül yüklenirken global değiştiriliyor. Ana uygulamanın sharp davranışını da etkiliyor. En azından belgele, mümkünse kapsamla. — YAPILDI, çağrı kaldırıldı. Thumbnail zaten buffer'dan üretildiği için sharp kaynak dosyayı hiç açmıyor. Windows'ta üç koşu üst üste, thumbnail sonrası silme, yeniden adlandırma ve taşıma testleri dahil, sorunsuz. Böylece `sideEffects: false` eklenebildi.
+- [x] **36.** `ensureUploadDir()` her istekte üç `mkdir` çağırıyor. Sonucu bir promise'te önbellekle. — YAPILDI. Hata önbelleğe alınmıyor, thumbnail üretimi `.tmb`'yi kendisi yeniden oluşturuyor.
+- [x] **37.** `mkdir`, `mkfile` ve `rename` gelen adda `/` veya `\` kontrolü yapmıyor. Kök dışına çıkamıyor ama dosyayı beklenmedik klasöre taşıyabiliyor. — YAPILDI, **bulgu büyüdü.**
+  - Madde 14'ün izin kancasını deliyordu: yalnızca hedefin `write` izni kontrol edildiği için `open/`'dan `name=../locked/x` ile yazma izni kapalı `locked/`'a klasör açılabiliyordu. `archive` da aynı açığa sahipti.
+  - Yanında iki sessiz veri kaybı çıktı: `mkfile` var olan dosyayı sıfır bayta indiriyordu (`wx` bayrağı yoktu), `archive` var olan dosyanın üzerine yazıyordu.
+  - Ayraç, `.`, `..` veya kontrol karakteri içeren adlar artık `errInvName` dönüyor. Yükleme adları eskisi gibi `safeSegment` ile kurtarılıyor.
+- [x] **38. `.chunks` dizini `public/` altında.** — YAPILDI, varsayılan `uploadDir` artık `<cwd>/uploads`. Kullanıcı `uploadDir`i elle `public/` altına koyarsa sorun o kurulumda sürüyor, README bunu önermiyor. Yarım kalan yüklemelerin içeriği `/uploads/.chunks/...` adresinden herkese açık. Chunk ve tmb dizinlerini servis edilen kökün dışına taşı.
+- [x] **39. `looksLikeElfinderHash`** — `/^v\d+_/` kalıbını sabit kodluyor. Özel bir `volumeId` verilirse yükleme dosya adı sezgiseli bozuluyor. `VOLUME_ID` değişkenini kullan. — YAPILDI, kalıp yerine `decodeHashStrict`. Bu, ikinci bir hatayı da kapattı: `v2_report` adlı sıradan bir dosya hash sanılıp başka adla kaydediliyordu.
+- [x] **40.** `detectMimeFromName` içindeki `.pdf` dalı ölü kod, `mime-types` zaten biliyor. — YAPILDI.
+- [x] **41.** Thumbnail ve dosya yanıtlarına `Cache-Control` ekle. — YAPILDI: `private, no-cache` ile zayıf `ETag` ve `Last-Modified`, eşleşince 304. Adres dosya üzerine yazılınca değişmediği için `max-age` verilmedi. zipdl arşivi `no-store`.
 
 ---
 
 ## P2 — Dağıtım
 
-### 42. Varsayılan yapılandırma serverless'ta çalışmıyor
+### 42. Varsayılan yapılandırma serverless'ta çalışmıyor — BELGELENDİ
 
 Bu README'de hiç geçmiyor ve ilk kurulumda insanları yakacak şey.
 
 Vercel gibi platformlarda `public/` içeriği **build sırasında** CDN'e yükleniyor ve çalışma anındaki dosya sistemi hem salt okunur hem geçici. Yani varsayılan `uploadDir` olan `public/uploads` orada ne yazılabiliyor ne de servis edilebiliyor.
 
-- [ ] README'ye "Dağıtım" bölümü ekle, desteklenen ve desteklenmeyen hedefleri yaz
-- [ ] Kalıcı disk veya S3 adaptörü gerektiğini açıkça belirt
+- [x] README'ye "Dağıtım" bölümü ekle, desteklenen ve desteklenmeyen hedefleri yaz
+- [x] Kalıcı disk veya S3 adaptörü gerektiğini açıkça belirt
 
-### 43. `output: "standalone"` varsayılan haliyle bozuk
+### 43. `output: "standalone"` varsayılan haliyle bozuk — BELGELENDİ
 
 Paket çökmüyor ama yüklenen dosyalar yanlış yere gidiyor ve her deploy'da siliniyor.
 
@@ -389,9 +398,9 @@ outputFileTracingIncludes: { "/*": ["node_modules/sharp/**/*"] },
 createElfinderHandler({ uploadDir: process.env.ELFINDER_DIR });  // mutlak yol, mount'lu volume
 ```
 
-- [ ] README'ye standalone bölümü ekle, yukarıdaki üç ayarı da göster
-- [ ] `uploadDir` verilmediğinde `process.cwd()` tahmininin riskli olduğunu belgele
-- [ ] Playground'un `next.config.ts` dosyasına `outputFileTracingRoot` ekle
+- [x] README'ye standalone bölümü ekle, yukarıdaki üç ayarı da göster
+- [x] `uploadDir` verilmediğinde `process.cwd()` tahmininin riskli olduğunu belgele
+- [x] Playground'un `next.config.ts` dosyasına `outputFileTracingRoot` ekle
 
 ### 44. `publicUrl: ""` ifade edilemiyor — YAPILDI
 
@@ -407,15 +416,41 @@ demek. Yani şu an standalone ve serverless için doğru yapılandırma kurulam�
 - [x] Boş olduğunda `cwd.options.url` alanını `""` olarak döndür
 - [x] Aynısını `tmbUrl` için yap
 
-### 45. Doğrulanması gereken: çalışma anında eklenen public dosyaları
+**Sonradan çıkan eksik:** boş `tmbUrl` thumbnail'leri kırıyordu. elFinder 2.1 istemcisi
+`tmbUrl` boşken `file.tmb` alanını olduğu gibi görsel adresi olarak kullanıyor
+(`elFinder.js` 2272-2278, `2.1-src` dalı). Connector oraya yalnızca dosya adı koyuyordu,
+bu da sayfaya göre çözülüp 404 veriyordu. Testler yalnızca `options` alanına baktığı
+için bunu yakalamadı.
+
+- [x] `tmbUrl` boşken `tmb` alanı connector URL'si oluyor:
+  `<basePath><route>?cmd=file&target=<kaynak hash>&thumb=1`
+- [x] Thumbnail kaynak dosyanın okuma iznine bağlı, `.tmb` yol olarak hiç açılmıyor
+- [x] `thumb=1` thumbnail üretmiyor, üretim yalnızca `cmd=tmb` içinde
+
+### 45. Çalışma anında eklenen public dosyaları — DOĞRULANDI, varsayılanlar değişti
 
 Next üretim modunda `public/` dosya listesini sunucu açılışında bir kez okuyup önbelleğe
 alıyor, bu yüzden çalışma anında eklenen dosyalar yeniden başlatılana kadar 404 dönüyor.
 Uzun süredir bilinen bir davranış ve eski dokümanda açıkça yazıyordu, güncel sayfada
 o not artık yok.
 
-- [ ] Next 16.2 üzerinde test et: `next start`, bir dosya yükle, `/uploads/<ad>` adresine git
-- [ ] Davranış sürüyorsa madde 44 P0'a çıkıyor, çünkü varsayılan kurulum önizleme gösteremiyor
+- [x] Next 16.2 üzerinde test et: `next start`, bir dosya yükle, `/uploads/<ad>` adresine git
+- [x] Davranış sürüyorsa madde 44 P0'a çıkıyor, çünkü varsayılan kurulum önizleme gösteremiyor
+
+Ölçüm (Next 16.2.6, `next start`, varsayılan yapılandırma):
+
+```
+connector ile yüklenen  /uploads/probe1.txt  -> 404
+diske doğrudan yazılan  /uploads/probe2.txt  -> 404
+build öncesi var olan   /next.svg            -> 200
+cmd=file                                     -> 200
+yeniden başlatma sonrası probe1 / probe2     -> 200 / 200
+```
+
+Karar: varsayılanlar değişti, sürüm 0.2.0. `uploadDir` = `<cwd>/uploads`,
+`publicUrl` ve `tmbUrl` = `""`. Aynı kurulum üzerinde uçtan uca doğrulandı: yeniden
+başlatmadan önizleme 200, thumbnail 200 `image/png`. Eski davranış README'deki
+"Upgrading from 0.1.x" bölümünde üç seçenekle geri alınabiliyor.
 
 ---
 
@@ -427,16 +462,18 @@ Aşağıdakiler `git ls-files` ile doğrulandı.
 - [x] **47. Karışık paket yöneticisi.** Kökte hem `package-lock.json` hem `pnpm-lock.yaml` var. npm lockfile'ı neredeyse boş, sil.
 - [x] **48. Build artefaktı commit'lenmiş.** `apps/playground/tsconfig.tsbuildinfo` gitignore'a girmeli.
 - [x] **49. Playground kırık.** `app/page.tsx` butonu `/elfinder-static/picker.html`, iframe'i `/elfinder/picker.html` açıyor. İkisi farklı, biri kesinlikle 404.
-- [ ] **50. Temiz klone playground çalışmıyor.** `.gitignore` içinde `apps/playground/public/elfinder` var, yani elFinder arayüz dosyaları depoda yok ve onları getiren bir adım veya script de yok. README "playground'u çalıştır" diyor ama çalışmıyor.
+- [x] **50. Temiz klone playground çalışmıyor.** `.gitignore` içinde `apps/playground/public/elfinder` var, yani elFinder arayüz dosyaları depoda yok ve onları getiren bir adım veya script de yok. README "playground'u çalıştır" diyor ama çalışmıyor. — YAPILDI. `picker.html` commit'lendi, elFinder 2.1.70 cdnjs'den yükleniyor, indirme adımı yok. Headless Edge ile `next start` üzerinde doğrulandı: ağaç, liste ve connector üzerinden thumbnail görünüyor.
 - [x] **51. Test yok.** — YAPILDI, 99 test 7 dosyada. Bir protokol connector'ı tam olarak sözleşme testi gerektiren şey. Geçici dizin ve fixture istekleriyle vitest kurmak bir günlük iş, yukarıdaki hataların çoğunu regresyona karşı kilitler.
 - [x] **52. CI yok.** — YAPILDI, 3 OS x Node 20/22 artı bloke etmeyen Node 18 işi. Build, test ve lint için bir workflow ekle.
-- [ ] **53. `LICENSE` dosyası yok.** README'deki rozet var olmayan bir dosyaya bağlanıyor.
-- [ ] **54.** `package.json` içinde `repository`, `homepage`, `bugs` ve `engines` alanları eksik. npm sayfasında kaynak bağlantısı görünmeyecek.
-- [ ] **55.** `files` dizisi `LICENSE`'ı da içermeli.
-- [ ] **56.** README hâlâ `v0.1.0` diyor, paket `0.1.1`.
-- [ ] **57.** Root README'deki `https://github.com/your-org/elfinder-next` placeholder'ını gerçek URL ile değiştir.
-- [ ] **58. Peer aralığı doğrulanmamış.** `peerDependencies` `next >= 14` diyor ama hem devDependency hem playground `16.2.6` kullanıyor. 14 ve 15 hiç denenmemiş. Ya CI'a matris ekle ya aralığı daralt.
-- [ ] **59.** CJS build eklemeyi düşün (`format: ["esm", "cjs"]`), `sideEffects: false` ekle.
+- [x] **53. `LICENSE` dosyası yok.** README'deki rozet var olmayan bir dosyaya bağlanıyor. — YAPILDI, kökte ve pakette.
+- [x] **54.** `package.json` içinde `repository`, `homepage`, `bugs` ve `engines` alanları eksik. npm sayfasında kaynak bağlantısı görünmeyecek. — YAPILDI (`engines` madde 60 ile gelmişti).
+- [x] **55.** `files` dizisi `LICENSE`'ı da içermeli. — YAPILDI, `npm pack` çıktısında görünüyor.
+- [x] **56.** README hâlâ `v0.1.0` diyor, paket `0.1.1`. — YAPILDI, ikisi de 0.2.0.
+- [x] **57.** Root README'deki `https://github.com/your-org/elfinder-next` placeholder'ını gerçek URL ile değiştir. — YAPILDI, kök README'deki `git clone <repository-url>` satırı da.
+- [x] **58. Peer aralığı doğrulanmamış.** `peerDependencies` `next >= 14` diyor ama hem devDependency hem playground `16.2.6` kullanıyor. 14 ve 15 hiç denenmemiş. Ya CI'a matris ekle ya aralığı daralt. — DOĞRULANDI, aralık korundu. 14.2.35 ve 15.5.26 üzerinde test paketi ve typecheck geçiyor. Tarball ile kurulan birer uygulamada yükleme, thumbnail ve arşiv `next start` altında çalışıyor. CI'a `next-compat` işi eklendi (14.2, 15.5). Next 14'te `serverExternalPackages` anahtarı tanınmıyor, README'ye not düşüldü.
+- [x] **59.** CJS build eklemeyi düşün (`format: ["esm", "cjs"]`), `sideEffects: false` ekle. — KARARA BAĞLANDI.
+  - CJS eklenmedi. Desteklenen her Next sürümü ESM paketi bundle ediyor (14 ve 15 dahil doğrulandı). Çift format ise `ElfinderError` için dual-package tehlikesi yaratır: iki kopya olursa `instanceof` bozulur.
+  - `sideEffects: false` eklenmedi. Modül yüklenirken `sharp.cache()` çağrılıyor (madde 35), yani beyan yanlış olur. 35 kapsamlandığında eklenmeli.
 
 ### 60. Node desteği iddiası yanlıştı — YAPILDI
 
@@ -460,15 +497,50 @@ Karar: iddia daraltıldı, globalden vazgeçilmedi.
 - [x] CI matrisi tabanı gerçekten test ediyor (`20.3` ve `22`)
 - [x] Bloke etmeyen `node18` işi kaldırıldı, sorusu cevaplandı
 
-Not: madde 54'teki `repository`, `homepage` ve `bugs` alanları hâlâ eksik.
+Not: madde 54'teki `repository`, `homepage` ve `bugs` alanları `chore/repo-hygiene` dalında eklendi.
 
 ---
 
-### Kırılganlık notu
+### 61. Turbopack tüm projeyi izliyor — ÖLÇÜLDÜ, yalnızca workspace bağlantısında, önlem belgelendi
+
+Madde 45 doğrulanırken çıktı, bu daldan önce de vardı (`4ee2328` üzerinde aynı uyarı).
+`next build` şunu raporluyor:
+
+```
+Encountered unexpected file in NFT list
+A file was traced that indicates that the whole project was traced unintentionally.
+Import trace: next.config.ts -> packages/elfinder-next/dist/index.js -> app/api/elfinder/route.ts
+```
+
+**İlk hipotez yanlıştı.** Sebep `process.cwd()` değil: `dist`ten `process.cwd()`
+tamamen çıkarıldığında da uyarı sürüyor. `/*turbopackIgnore: true*/` yorumu tsup
+çıktısında korunuyor, ama yalnızca `cwd`, yalnızca `path` çağrıları ya da yalnızca `fs`
+çağrıları işaretlendiğinde uyarı kaybolmuyor. Ancak bundle'daki 114 `fs`/`path`
+çağrısının hepsi işaretlenince kayboluyor. Yani birbirinden bağımsız birden çok
+tetikleyici var.
+
+**Etki beklenenden ciddi, ama dar:**
+
+- Workspace bağlantısıyla (playground'daki gibi) build sırasında `apps/playground/uploads/`
+  altında duran dosyalar, `private/salary.xlsx` dahil, route'un `.nft.json` listesine
+  girdi. Standalone build'de bunlar `.next/standalone`'a, yani Docker imajına kopyalanır.
+- Tarball'dan `node_modules`'a kurulan temiz bir Next 16.2.6 uygulamasında uyarı yok,
+  `uploads/` izlenmiyor, `node_modules` dışındaki 5 dosyanın hepsi build chunk'ı.
+  npm kullanıcıları etkilenmiyor.
+- Paketi `serverExternalPackages`'a eklemek workspace bağlantısında işe yaramıyor.
+
+Karar: 114 yere yorum eklenmedi. Kırılgan olur ve npm kullanıcılarında sorun yok.
+
+- [x] Yorumun `dist/index.js` içinde korunup korunmadığını kontrol et (korunuyor, ama yetmiyor)
+- [x] `outputFileTracingExcludes: { "/api/elfinder": ["./uploads/**/*"] }` ile `uploads/` izlemeden çıkıyor, doğrulandı
+- [x] Playground'a bu ayar eklendi, README'nin standalone bölümüne uyarı ve ayar yazıldı
+- [ ] Uyarı metni playground build'inde hâlâ çıkıyor (kozmetik). Kalıcı çözüm dinamik yolları tek bir modülde toplamak olabilir, madde 32 (StorageAdapter) ile birlikte ele alınmalı.
+
+### Kırılganlık notu — YAPILDI, README artık düz değerleri gösteriyor
 
 `export const { GET, POST, runtime } = createElfinderHandler()` kalıbı Next'in segment yapılandırmasını statik olarak okumasına dayanıyor. Destructuring bir fonksiyon çağrısından geldiği için Next bunu statik olarak çözemez. Bugün sorun çıkmıyor çünkü `nodejs` zaten varsayılan runtime, ama bu şansa kalmış bir durum.
 
-- [ ] README'de `runtime`'ı ayrıca ve düz değer olarak yazmayı öner:
+- [x] README'de `runtime`'ı ayrıca ve düz değer olarak yazmayı öner:
 
 ```ts
 export const runtime = "nodejs";

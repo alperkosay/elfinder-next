@@ -1,3 +1,4 @@
+import fs from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { hashOf, makeVolume } from "./helpers.js";
 
@@ -140,5 +141,74 @@ describe("cmd=file rejects non-files", () => {
     const vol = await makeVolume();
     const response = await vol.GET("cmd=file&target=v1_Lw");
     expect(await response.json()).toEqual({ error: ["errFileNotFound"] });
+  });
+});
+
+describe("file responses can be revalidated but not reused unchecked (item 41)", () => {
+  const target = hashOf("a.txt");
+
+  it("is private, must be revalidated, and carries validators", async () => {
+    const response = await serve("a.txt", BODY);
+    // private: the route may sit behind authorize, so no shared cache may keep it.
+    // no-cache: the URL stays the same when the file is overwritten.
+    expect(response.headers.get("cache-control")).toBe("private, no-cache");
+    expect(response.headers.get("etag")).toMatch(/^W\/"[0-9a-f]+-[0-9a-f]+"$/);
+    expect(response.headers.get("last-modified")).toBeTruthy();
+  });
+
+  it("answers 304 without a body when the ETag still matches", async () => {
+    const vol = await makeVolume({ "a.txt": BODY });
+    const first = await vol.GET(`cmd=file&target=${target}`);
+    const etag = first.headers.get("etag")!;
+
+    const second = await vol.GET(`cmd=file&target=${target}`, {
+      headers: { "if-none-match": etag },
+    });
+    expect(second.status).toBe(304);
+    expect(await second.text()).toBe("");
+    expect(second.headers.get("etag")).toBe(etag);
+  });
+
+  it("serves the new contents once the file changes", async () => {
+    const vol = await makeVolume({ "a.txt": BODY });
+    const etag = (await vol.GET(`cmd=file&target=${target}`)).headers.get("etag")!;
+
+    await fs.writeFile(vol.at("a.txt"), "changed");
+    const future = new Date(Date.now() + 5000);
+    await fs.utimes(vol.at("a.txt"), future, future);
+
+    const response = await vol.GET(`cmd=file&target=${target}`, {
+      headers: { "if-none-match": etag },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe("changed");
+  });
+
+  it("honours If-Modified-Since when there is no ETag to compare", async () => {
+    const vol = await makeVolume({ "a.txt": BODY });
+    const lastModified = (await vol.GET(`cmd=file&target=${target}`)).headers.get(
+      "last-modified",
+    )!;
+
+    const response = await vol.GET(`cmd=file&target=${target}`, {
+      headers: { "if-modified-since": lastModified },
+    });
+    expect(response.status).toBe(304);
+  });
+
+  it("does not let the zipdl archive be cached at all", async () => {
+    const vol = await makeVolume({ "docs/a.txt": "A", "docs/b.txt": "B" });
+    const { zipdl } = await (
+      await vol.GET(
+        `cmd=zipdl&targets[]=${hashOf("docs/a.txt")}&targets[]=${hashOf("docs/b.txt")}`,
+      )
+    ).json();
+
+    const response = await vol.GET(
+      `cmd=zipdl&download=1&targets[]=${hashOf("docs")}&targets[]=${zipdl.file}` +
+        `&targets[]=${encodeURIComponent(zipdl.name)}&targets[]=application/zip`,
+    );
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(response.headers.get("etag")).toBeNull();
   });
 });

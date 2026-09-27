@@ -1,8 +1,9 @@
 {
   "name": "elfinder-next",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "elFinder 2.1 connector for Next.js App Router API routes",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -14,7 +15,8 @@
   },
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsup",
@@ -29,6 +31,15 @@
     "file-manager",
     "connector"
   ],
+  "homepage": "https://github.com/alperkosay/elfinder-next/tree/main/packages/elfinder-next#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alperkosay/elfinder-next.git",
+    "directory": "packages/elfinder-next"
+  },
+  "bugs": {
+    "url": "https://github.com/alperkosay/elfinder-next/issues"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=20.3.0"

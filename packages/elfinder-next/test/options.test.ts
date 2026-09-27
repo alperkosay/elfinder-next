@@ -1,6 +1,9 @@
+import fs from "node:fs/promises";
 import path from "node:path";
+import sharp from "sharp";
 import { describe, expect, it } from "vitest";
-import { ROOT_HASH, json, makeVolume } from "./helpers.js";
+import { resolveContext } from "../src/context.js";
+import { ROOT_HASH, hashOf, json, makeVolume } from "./helpers.js";
 
 /** The root volume options elFinder reads on init. */
 async function rootOptions(options = {}) {
@@ -10,11 +13,13 @@ async function rootOptions(options = {}) {
 }
 
 describe("url prefixes (item 44)", () => {
-  it("uses /uploads/ by default", async () => {
+  it("serves everything through the connector by default (item 45)", async () => {
+    // Next snapshots public/ at startup, so a static prefix for runtime uploads
+    // answers 404 until a restart. Empty prefixes route through cmd=file instead.
     const { cwd, top } = await rootOptions();
-    expect(cwd.options.url).toBe("/uploads/");
-    expect(cwd.options.tmbUrl).toBe("/uploads/.tmb/");
-    expect(top.tmbUrl).toBe("/uploads/.tmb/");
+    expect(cwd.options.url).toBe("");
+    expect(cwd.options.tmbUrl).toBe("");
+    expect(top.tmbUrl).toBe("");
   });
 
   it("appends a missing trailing slash", async () => {
@@ -44,6 +49,33 @@ describe("volume identity", () => {
     expect(body.files.every((f: any) => f.hash.startsWith("v9_"))).toBe(true);
   });
 
+  it("recognizes its own hash in upload_path[] whatever the volume id (item 39)", async () => {
+    // elFinder sends the destination's hash in upload_path[] on a plain upload. The
+    // connector used to spot it with /^v\d+_/, so under "files_" the hash itself
+    // became the file name.
+    const vol = await makeVolume({}, { volumeId: "files_" });
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", "files_Lw");
+    form.append("upload[]", new File(["x"], "photo.txt"));
+    form.append("upload_path[]", "files_Lw");
+
+    await vol.POST(form);
+    expect(await vol.exists("photo.txt")).toBe(true);
+    expect(await vol.exists("files_Lw")).toBe(false);
+  });
+
+  it("keeps a file whose name merely looks like a hash", async () => {
+    const vol = await makeVolume();
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", ROOT_HASH);
+    form.append("upload[]", new File(["x"], "v2_report"));
+
+    await vol.POST(form);
+    expect(await vol.exists("v2_report")).toBe(true);
+  });
+
   it("refuses a hash minted for a different volume id", async () => {
     const vol = await makeVolume({ "src/f.txt": "x" }, { volumeId: "v9_" });
     // A v1_ hash is not ours when volumeId is v9_.
@@ -53,6 +85,11 @@ describe("volume identity", () => {
 });
 
 describe("uploadDir resolution", () => {
+  it("defaults to a directory outside public/ (item 38)", () => {
+    // Under public/, the half-uploaded parts in .chunks were downloadable by anyone.
+    expect(resolveContext().uploadDir).toBe(path.resolve(process.cwd(), "uploads"));
+  });
+
   it("accepts an absolute uploadDir", async () => {
     const vol = await makeVolume({ "a.txt": "x" });
     expect(path.isAbsolute(vol.uploadDir)).toBe(true);
@@ -65,6 +102,29 @@ describe("uploadDir resolution", () => {
     await vol.GET(`cmd=open&init=1&target=${ROOT_HASH}`);
     expect(await vol.exists(".tmb")).toBe(true);
     expect(await vol.exists(".chunks")).toBe(true);
+  });
+
+  it("creates them once, not on every request (item 36)", async () => {
+    const vol = await makeVolume();
+    await vol.GET(`cmd=open&init=1&target=${ROOT_HASH}`);
+    await fs.rm(vol.at(".chunks"), { recursive: true });
+
+    await vol.GET(`cmd=open&target=${ROOT_HASH}`);
+    expect(await vol.exists(".chunks")).toBe(false);
+  });
+
+  it("still writes a thumbnail after .tmb disappears", async () => {
+    const png = await sharp({
+      create: { width: 60, height: 40, channels: 3, background: "#08c" },
+    })
+      .png()
+      .toBuffer();
+    const vol = await makeVolume({ "a.png": png });
+    await vol.GET(`cmd=open&init=1&target=${ROOT_HASH}`);
+    await fs.rm(vol.at(".tmb"), { recursive: true });
+
+    const body = await json(await vol.GET(`cmd=tmb&targets[]=${hashOf("a.png")}`));
+    expect(Object.keys(body.images)).toHaveLength(1);
   });
 });
 

@@ -40,3 +40,28 @@ jobs:
         # Catches what the unit tests cannot: that the built package still
         # type-checks and bundles inside a real Next.js app.
         run: pnpm --filter playground build
+
+  next-compat:
+    # peerDependencies claims next >= 14, while the main job only ever sees the
+    # 16.x devDependency. This runs the contract suite against the last minor of
+    # each earlier major, so the claim stays tested rather than assumed.
+    name: next ${{ matrix.next }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        next: ["14.2", "15.5"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - name: Swap in next ${{ matrix.next }}
+        run: pnpm --filter elfinder-next add -D next@~${{ matrix.next }} react@18 react-dom@18
+      - run: pnpm typecheck
+      - run: pnpm test

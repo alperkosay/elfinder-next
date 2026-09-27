@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
-import { createReadStream } from "fs";
-import { createHash } from "crypto";
+import { createReadStream, createWriteStream } from "fs";
+import { pipeline } from "stream/promises";
+import { createHash, randomUUID } from "crypto";
 import { AsyncLocalStorage } from "async_hooks";
 import { Readable } from "stream";
 import path from "path";
@@ -12,11 +13,29 @@ import type { ElfinderContext } from "./context.js";
 import { ElfinderAuthError, ElfinderError, toErrorResponse } from "./errors.js";
 import type { ElfinderFile, ElfinderHandlers } from "./types.js";
 
+/**
+ * Renders a byte count the way elFinder's `uplMaxSize` is written, e.g. `"256M"`.
+ *
+ * The client parses this string rather than a number, and shows it verbatim in the
+ * error it raises for an oversized file.
+ */
+function formatByteSize(bytes: number): string {
+  const units: Array<[number, string]> = [
+    [1024 ** 3, "G"],
+    [1024 ** 2, "M"],
+    [1024, "K"],
+  ];
+  for (const [size, suffix] of units) {
+    if (bytes >= size && bytes % size === 0) {
+      return `${bytes / size}${suffix}`;
+    }
+  }
+  return String(bytes);
+}
+
 /** A permission with every default applied, so callers never re-check for undefined. */
 type ResolvedPermission = { read: boolean; write: boolean; locked: boolean };
 
-// libvips keeps input file handles in its cache; on Windows that blocks unlink (EBUSY).
-sharp.cache({ files: 0 });
 
 type ParamBag = {
   get: (key: string) => string | null;
@@ -79,6 +98,23 @@ function safeSegment(raw: string): string | null {
     return null;
   }
   return cleaned;
+}
+
+/**
+ * Validates a name the client chose for a new or renamed entry.
+ *
+ * Unlike safeSegment, which salvages a usable name from upload metadata, this
+ * refuses. A typed name containing a separator or `..` would be joined onto the
+ * target and normalized into a different directory — one whose permissions were
+ * never checked — and quietly trimming it would create an entry nobody named.
+ */
+function requireEntryName(raw: string | null, fallback = ""): string {
+  const name = (raw || fallback).trim();
+  // eslint-disable-next-line no-control-regex
+  if (!name || name === "." || name === ".." || /[/\\\u0000-\u001f]/.test(name)) {
+    throw new ElfinderError("errInvName");
+  }
+  return name;
 }
 
 async function rmWithRetry(
@@ -247,11 +283,15 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     rootHash: ROOT_HASH,
     tmbDir: TMB_DIR,
     chunkDir: CHUNK_DIR,
+    tmpDir: TMP_DIR,
     publicUrl: PUBLIC_URL,
     tmbUrl: TMB_URL,
     maxArchiveEntries: MAX_ARCHIVE_ENTRIES,
     maxArchiveBytes: MAX_ARCHIVE_BYTES,
     chunkTtlMs: CHUNK_TTL_MS,
+    maxUploadBytes: MAX_UPLOAD_BYTES,
+    maxUploadFiles: MAX_UPLOAD_FILES,
+    maxSearchResults: MAX_SEARCH_RESULTS,
     authorize: AUTHORIZE,
     permissions: PERMISSIONS,
   } = ctx;
@@ -386,6 +426,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     session: unknown;
     /** Memoizes permission lookups so a listing asks about each path once. */
     cache: Map<string, ResolvedPermission>;
+    /** Path of the route serving this request, basePath included. */
+    connectorUrl: string;
+    /** Read for conditional requests, so streamFile can answer 304. */
+    headers: Headers;
   };
 
   /**
@@ -439,6 +483,45 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
   }
 
+  /**
+   * Part filenames in `dir` belonging to the same upload as `chunkName`, in offset
+   * order.
+   *
+   * elFinder names slices `<file>.<index>_<count>.part`, so the base name identifies
+   * the upload and the index orders it. Sorting numerically matters: lexical order
+   * puts `.10_` before `.2_` and would concatenate the file scrambled.
+   */
+  function chunkBaseName(chunkName: string): string {
+    return chunkName.replace(/\.\d+_\d+\.part$/, "");
+  }
+
+  async function chunkPartNames(dir: string, chunkName: string): Promise<string[]> {
+    return chunkPartNamesForBase(dir, chunkBaseName(chunkName));
+  }
+
+  async function chunkPartNamesForBase(dir: string, base: string): Promise<string[]> {
+    const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`^${escaped}\\.(\\d+)_\\d+\\.part$`);
+
+    const entries = await fs.readdir(dir).catch(() => [] as string[]);
+    const indexOf = (name: string) => Number(pattern.exec(name)?.[1] ?? 0);
+    return entries.filter((name) => pattern.test(name)).sort((a, b) => indexOf(a) - indexOf(b));
+  }
+
+  /** Sizes of the parts already written for this upload. */
+  async function chunkPartSizes(dir: string, chunkName: string): Promise<number[]> {
+    const names = await chunkPartNames(dir, chunkName);
+    return Promise.all(
+      names.map(async (name) => {
+        try {
+          return (await fs.stat(path.resolve(dir, name))).size;
+        } catch {
+          return 0;
+        }
+      }),
+    );
+  }
+
   /** Parent directory of a path, as permissions and `phash` see it. */
   function parentOf(relativePath: string): string {
     const parent = normalizeRelativePath(path.posix.dirname(relativePath));
@@ -479,12 +562,29 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
    * The sweep interval is capped by the TTL itself, which keeps a deliberately
    * short TTL responsive instead of waiting out a fixed timer.
    */
-  async function sweepAbandonedChunks(): Promise<void> {
+  async function sweepStaleTemp(): Promise<void> {
     const now = Date.now();
     if (now - lastChunkSweep < Math.min(CHUNK_TTL_MS, 5 * 60_000)) {
       return;
     }
     lastChunkSweep = now;
+
+    // Staged zipdl archives expire on the same clock. Phase two normally collects and
+    // deletes them, but a client that walks away leaves one behind.
+    const staged = await fs.readdir(TMP_DIR).catch(() => [] as string[]);
+    await Promise.all(
+      staged.map(async (name) => {
+        const file = path.resolve(TMP_DIR, name);
+        try {
+          const stat = await fs.stat(file);
+          if (now - stat.mtimeMs >= CHUNK_TTL_MS) {
+            await rmWithRetry(file, { force: true });
+          }
+        } catch {
+          // Being collected by the request that made it.
+        }
+      }),
+    );
 
     let entries;
     try {
@@ -510,10 +610,24 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     );
   }
 
-  async function ensureUploadDir(): Promise<void> {
-    await fs.mkdir(UPLOAD_DIR, { recursive: true });
-    await fs.mkdir(TMB_DIR, { recursive: true });
-    await fs.mkdir(CHUNK_DIR, { recursive: true });
+  let uploadDirReady: Promise<void> | null = null;
+
+  /**
+   * Creates the volume and its bookkeeping directories once per handler, rather
+   * than issuing four mkdir calls on every request. A failure is not cached, so a
+   * volume that was briefly unavailable (an unmounted disk, say) is retried.
+   */
+  function ensureUploadDir(): Promise<void> {
+    uploadDirReady ??= (async () => {
+      await fs.mkdir(UPLOAD_DIR, { recursive: true });
+      await Promise.all(
+        [TMB_DIR, CHUNK_DIR, TMP_DIR].map((dir) => fs.mkdir(dir, { recursive: true })),
+      );
+    })().catch((error) => {
+      uploadDirReady = null;
+      throw error;
+    });
+    return uploadDirReady;
   }
 
   function isImageMime(mimeType: string): boolean {
@@ -555,19 +669,16 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   function detectMimeFromName(name: string): string {
-    const byLookup = mime.lookup(name);
-    if (byLookup) {
-      return byLookup;
-    }
-    const ext = path.posix.extname(name).toLowerCase();
-    if (ext === ".pdf") {
-      return "application/pdf";
-    }
-    return "application/octet-stream";
+    return mime.lookup(name) || "application/octet-stream";
   }
 
+  /**
+   * Whether `value` is one of this volume's hashes, which elFinder puts in
+   * upload_path[] in place of a name. Decoding rather than pattern-matching means
+   * a custom volumeId is recognized and a file named like `v2_report` is not.
+   */
   function looksLikeElfinderHash(value: string): boolean {
-    return /^v\d+_[A-Za-z0-9\-_]+$/.test(value);
+    return decodeHashStrict(value) !== null;
   }
 
   function chooseUploadFilename(candidates: Array<string | null | undefined>): string {
@@ -632,6 +743,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     try {
       // Read into a buffer so sharp never holds a path-based lock on the source file.
       const input = await fs.readFile(absolute);
+      // ensureUploadDir runs once per handler, so .tmb may have been removed since.
+      await fs.mkdir(TMB_DIR, { recursive: true });
       await sharp(input)
         .resize(48, 48, { fit: "inside", withoutEnlargement: true })
         .png()
@@ -644,6 +757,22 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     // batch, so a request generating fifty thumbnails scans .tmb once rather than
     // fifty times.
     return thumbName;
+  }
+
+  /**
+   * What goes in a file's `tmb` field once its thumbnail exists.
+   *
+   * With a `tmbUrl` the client prefixes it, so the bare filename is enough. Without
+   * one the 2.1 client uses `tmb` verbatim as the image URL, so it must be a full
+   * address, and since nothing serves `.tmb` statically that address is the
+   * connector itself.
+   */
+  function thumbReference(relativePath: string, thumbName: string): string {
+    if (TMB_URL) {
+      return thumbName;
+    }
+    const connectorUrl = scopeStorage.getStore()?.connectorUrl ?? "";
+    return `${connectorUrl}?cmd=file&target=${encodeHash(relativePath)}&thumb=1`;
   }
 
   /**
@@ -758,16 +887,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       info.phash = encodeHash(parent === "." ? "" : parent);
     } else {
       info.phash = "";
-      info.options = {
-        disabled: ["chmod", "netmount", "size"],
-        archivers: {
-          create: [],
-          extract: [],
-        },
-        url: PUBLIC_URL,
-        tmbUrl: TMB_URL,
-        separator: "/",
-      };
+    }
+
+    if (isDir) {
+      // elFinder reads these from the *current* directory, not from the root, so a
+      // subfolder without them loses the archive commands and the file URL base.
+      info.options = volumeOptions();
     }
 
     if (isDir) {
@@ -780,7 +905,8 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       // fetch it through cmd=tmb in batches. Generating it here instead would run
       // one sharp resize per image every time a directory is listed, so opening a
       // folder of 500 images would be 500 resizes inside a single request.
-      info.tmb = (await existingThumbForFile(normalized, stat)) ?? "1";
+      const thumbName = await existingThumbForFile(normalized, stat);
+      info.tmb = thumbName ? thumbReference(normalized, thumbName) : "1";
     }
 
     return info;
@@ -791,7 +917,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const absoluteDir = await resolveWithinRoot(baseRelative);
     const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
     const visible = entries.filter(
-      (entry) => entry.name !== ".tmb" && entry.name !== ".chunks",
+      (entry) => !isBookkeepingPath(path.join(absoluteDir, entry.name)),
     );
     // Bounded rather than Promise.all over the whole directory: each entry costs
     // at least a stat, and a directory with thousands of files would otherwise
@@ -881,22 +1007,71 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
   }
 
+  /**
+   * True for the connector's own bookkeeping directories and their contents.
+   *
+   * Compared by resolved path rather than by name, so a user folder that happens to
+   * be called `.tmb` deeper in the tree stays visible. Only the two at the volume
+   * root are ours.
+   */
+  function isBookkeepingPath(absolute: string): boolean {
+    return [TMB_DIR, CHUNK_DIR, TMP_DIR].some(
+      (dir) => absolute === dir || absolute.startsWith(`${dir}${path.sep}`),
+    );
+  }
+
+  /**
+   * Walks a directory tree depth-first, skipping the connector's own bookkeeping
+   * directories.
+   *
+   * The visitor returns `false` to stop the walk, which is what keeps a search over a
+   * large volume bounded instead of enumerating everything before truncating.
+   */
   async function walkRecursive(
     base: string,
-    visitor: (fullPath: string) => Promise<void>,
-  ) {
+    visitor: (fullPath: string) => Promise<boolean | void>,
+  ): Promise<boolean> {
     const entries = await fs.readdir(base, { withFileTypes: true });
     for (const entry of entries) {
       const current = path.join(base, entry.name);
-      await visitor(current);
-      if (entry.isDirectory()) {
-        await walkRecursive(current, visitor);
+      if (isBookkeepingPath(current)) {
+        continue;
+      }
+      if ((await visitor(current)) === false) {
+        return false;
+      }
+      if (entry.isDirectory() && (await walkRecursive(current, visitor)) === false) {
+        return false;
       }
     }
+    return true;
   }
 
   function relFromAbs(absolutePath: string): string {
     return normalizeRelativePath(path.relative(UPLOAD_DIR, absolutePath));
+  }
+
+  /**
+   * The volume capability block elFinder attaches to a directory.
+   *
+   * `archivers` is what actually drives the UI: the Archive and Extract commands are
+   * hidden unless the mime type appears here, which is why both were unreachable
+   * while the handlers for them existed. `disabled` must not list a command that
+   * works, for the same reason in reverse.
+   */
+  function volumeOptions(): NonNullable<ElfinderFile["options"]> {
+    return {
+      // chmod has no meaning for this backend and netmount has no driver; `size` is
+      // implemented and deliberately absent from this list.
+      disabled: ["chmod", "netmount"],
+      archivers: {
+        create: ["application/zip"],
+        extract: ["application/zip"],
+      },
+      url: PUBLIC_URL,
+      tmbUrl: TMB_URL,
+      separator: "/",
+    };
   }
 
   async function handleOpen(params: ParamBag) {
@@ -917,6 +1092,19 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const children = await listDirectory(target);
     const files = init ? [await toFileInfo(""), ...children] : children;
 
+    // With tree=1 the client is drawing the navigation pane and expects the folders
+    // above and beside the current one in the same response. Without them the pane
+    // shows only the branch it happens to have walked into.
+    if (isTruthy(params.get("tree"))) {
+      const seen = new Set(files.map((file) => file.hash));
+      for (const folder of await ancestorFolders(target)) {
+        if (!seen.has(folder.hash)) {
+          seen.add(folder.hash);
+          files.push(folder);
+        }
+      }
+    }
+
     return NextResponse.json({
       ...(init ? { api: "2.1" } : {}),
       cwd,
@@ -925,6 +1113,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         uiCmdMap: [],
         tmbUrl: TMB_URL,
       },
+      // Advertised so the client can refuse an oversized file before sending it and
+      // batch a large selection, instead of discovering the limit from an error.
+      ...(MAX_UPLOAD_BYTES > 0 ? { uplMaxSize: formatByteSize(MAX_UPLOAD_BYTES) } : {}),
+      ...(MAX_UPLOAD_FILES > 0 ? { uplMaxFile: MAX_UPLOAD_FILES } : {}),
     });
   }
 
@@ -937,8 +1129,14 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     });
   }
 
-  async function handleParents(params: ParamBag) {
-    const target = decodeHash(params.get("target"));
+  /**
+   * The root, plus every readable folder on the path from the root to `target` and
+   * beside it.
+   *
+   * This is the shape the navigation pane needs, and both `parents` and an `open` with
+   * `tree=1` ask for it.
+   */
+  async function ancestorFolders(target: string): Promise<ElfinderFile[]> {
     const tree = new Map<string, ElfinderFile>();
 
     const rootInfo = await toFileInfo("");
@@ -963,15 +1161,17 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       current = parent;
     }
 
-    return NextResponse.json({ tree: Array.from(tree.values()) });
+    return Array.from(tree.values());
+  }
+
+  async function handleParents(params: ParamBag) {
+    const target = decodeHash(params.get("target"));
+    return NextResponse.json({ tree: await ancestorFolders(target) });
   }
 
   async function handleMkdir(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
-    const name = (params.get("name") || "New Folder").trim();
-    if (!name) {
-      throw new ElfinderError("errInvName");
-    }
+    const name = requireEntryName(params.get("name"), "New Folder");
     await requireWrite(target);
     const targetRelative = normalizeRelativePath(target ? `${target}/${name}` : name);
     const absolute = await resolveWithinRoot(targetRelative);
@@ -1006,10 +1206,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleRename(params: ParamBag) {
     const targetHash = params.get("target");
-    const name = (params.get("name") || "").trim();
-    if (!targetHash || !name) {
+    if (!targetHash) {
       throw new ElfinderError("errInvName");
     }
+    const name = requireEntryName(params.get("name"));
 
     const oldRelative = decodeHash(targetHash);
     if (!oldRelative) {
@@ -1048,6 +1248,24 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errNotFile");
     }
 
+    // The address thumbReference hands out when there is no tmbUrl. Addressed by the
+    // source rather than the thumbnail's own name, so the source's read permission
+    // is what gates it and .tmb never has to be reachable as a path.
+    if (params.get("thumb") === "1") {
+      const thumbName = await existingThumbForFile(target, stat);
+      if (!thumbName) {
+        throw new ElfinderError("errFileNotFound");
+      }
+      const thumbPath = path.resolve(TMB_DIR, thumbName);
+      return streamFile(thumbPath, await fs.stat(thumbPath), {
+        filename: thumbName,
+        contentType: "image/png",
+        disposition: "inline",
+        rangeHeader,
+        cache: "revalidate",
+      });
+    }
+
     const filename = path.posix.basename(target);
     const contentType = mime.lookup(filename) || "application/octet-stream";
     const download = params.get("download") === "1";
@@ -1056,15 +1274,64 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     // when elFinder asked to preview it.
     const disposition = !download && isInlineSafeMime(contentType) ? "inline" : "attachment";
 
+    return streamFile(absolute, stat, {
+      filename,
+      contentType,
+      disposition,
+      rangeHeader,
+      cache: "revalidate",
+    });
+  }
+
+  /**
+   * Streams a file on disk as an HTTP response, honouring a Range request.
+   *
+   * Shared by cmd=file and the second phase of zipdl, which need identical framing:
+   * both must stream rather than buffer, and both must answer ranged requests so a
+   * browser can resume or seek.
+   *
+   * Volume files are `private, no-cache` with validators: private because the route
+   * may sit behind `authorize`, and revalidated because a file's URL does not change
+   * when it is overwritten. An unchanged file then costs a 304 rather than a full
+   * download. The zipdl archive is single-use and is never stored.
+   */
+  function streamFile(
+    absolutePath: string,
+    stat: { size: number; mtimeMs: number },
+    options: {
+      filename: string;
+      contentType: string;
+      disposition: "inline" | "attachment";
+      rangeHeader: string | null;
+      cache: "revalidate" | "no-store";
+    },
+  ): NextResponse {
     const baseHeaders: Record<string, string> = {
-      "Content-Type": contentType,
-      "Content-Disposition": contentDisposition(filename, disposition),
+      "Content-Type": options.contentType,
+      "Content-Disposition": contentDisposition(options.filename, options.disposition),
       "X-Content-Type-Options": "nosniff",
       // Without this the browser will not seek in audio or video previews.
       "Accept-Ranges": "bytes",
     };
 
-    const range = parseRange(rangeHeader, stat.size);
+    if (options.cache === "no-store") {
+      baseHeaders["Cache-Control"] = "no-store";
+    } else {
+      // Weak: equal size and mtime say the content is the same, not the bytes proven.
+      const etag = `W/"${stat.size.toString(16)}-${Math.floor(stat.mtimeMs).toString(16)}"`;
+      const modifiedSeconds = Math.floor(stat.mtimeMs / 1000);
+      const validators = {
+        "Cache-Control": "private, no-cache",
+        ETag: etag,
+        "Last-Modified": new Date(modifiedSeconds * 1000).toUTCString(),
+      };
+      if (isNotModified(etag, modifiedSeconds)) {
+        return new NextResponse(null, { status: 304, headers: validators });
+      }
+      Object.assign(baseHeaders, validators);
+    }
+
+    const range = parseRange(options.rangeHeader, stat.size);
     if (range === "unsatisfiable") {
       return new NextResponse(null, {
         status: 416,
@@ -1078,7 +1345,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
     // Streamed rather than read into a buffer: a large file would otherwise be
     // held in memory in full, once per concurrent request.
-    const source = createReadStream(absolute, stat.size === 0 ? {} : { start, end });
+    const source = createReadStream(absolutePath, stat.size === 0 ? {} : { start, end });
     const body = Readable.toWeb(source) as ReadableStream<Uint8Array>;
 
     return new NextResponse(body, {
@@ -1091,6 +1358,26 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     });
   }
 
+  /**
+   * Evaluates If-None-Match, or If-Modified-Since when that is absent, as RFC 9110
+   * orders them. ETags compare weakly, which is what a GET revalidation calls for.
+   */
+  function isNotModified(etag: string, modifiedSeconds: number): boolean {
+    const headers = scopeStorage.getStore()?.headers;
+    if (!headers) {
+      return false;
+    }
+    const ifNoneMatch = headers.get("if-none-match");
+    if (ifNoneMatch !== null) {
+      const opaque = (tag: string) => tag.trim().replace(/^W\//, "");
+      return ifNoneMatch
+        .split(",")
+        .some((tag) => tag.trim() === "*" || opaque(tag) === opaque(etag));
+    }
+    const since = Date.parse(headers.get("if-modified-since") ?? "");
+    return !Number.isNaN(since) && modifiedSeconds * 1000 <= since;
+  }
+
   async function handleLs(params: ParamBag) {
     const target = decodeHash(params.get("target"));
     await requireRead(target);
@@ -1100,10 +1387,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleMkfile(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
-    const name = (params.get("name") || "newfile.txt").trim();
+    const name = requireEntryName(params.get("name"), "newfile.txt");
     await requireWrite(target);
     const relative = normalizeRelativePath(target ? `${target}/${name}` : name);
-    await fs.writeFile(await resolveWithinRoot(relative), "");
+    // "wx": an existing file of the same name answers errExists rather than being
+    // truncated to zero bytes.
+    await fs.writeFile(await resolveWithinRoot(relative), "", { flag: "wx" });
     return NextResponse.json({ added: [await toFileInfo(relative)] });
   }
 
@@ -1113,8 +1402,21 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       throw new ElfinderError("errFileNotFound");
     }
     await requireRead(target);
-    const content = await fs.readFile(await resolveWithinRoot(target), "utf8");
-    return NextResponse.json({ content });
+    const bytes = await fs.readFile(await resolveWithinRoot(target));
+
+    // elFinder's editor sends `conv=1` to mean "give me the file even if it is not
+    // valid UTF-8". Without the check, invalid bytes were silently replaced with
+    // U+FFFD, and saving the result back destroyed the file. Refusing by default lets
+    // the client offer to open it read-only instead.
+    const text = bytes.toString("utf8");
+    if (!isTruthy(params.get("conv")) && text.includes("�")) {
+      const roundTrip = Buffer.from(text, "utf8");
+      if (!roundTrip.equals(bytes)) {
+        throw new ElfinderError("errNotUTF8Content");
+      }
+    }
+
+    return NextResponse.json({ content: text });
   }
 
   async function handlePut(params: ParamBag) {
@@ -1131,7 +1433,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   async function handleInfo(params: ParamBag) {
     const targets = getTargets(params);
     const readable: string[] = [];
-    for (const relative of targets.map((hash) => decodeHash(hash)).filter(Boolean)) {
+    const decoded = targets
+      .map((hash) => decodeHashStrict(hash))
+      .filter((relative): relative is string => relative !== null);
+    for (const relative of decoded) {
       // Omitted rather than refused: elFinder asks about a whole selection at once,
       // and one forbidden item should not blank out the rest.
       if ((await permissionFor(relative)).read) {
@@ -1140,6 +1445,30 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
     const files = await Promise.all(readable.map((relative) => toFileInfo(relative)));
     return NextResponse.json({ files });
+  }
+
+  /**
+   * Picks the first unused `name(copy)`, `name(copy 2)`, … in a directory.
+   *
+   * Duplicating twice used to fail: the name was always `name(copy)` and the second
+   * attempt hit errorOnExist. elFinder's own numbering is what users expect here.
+   */
+  async function firstFreeCopyName(
+    parent: string,
+    base: string,
+    ext: string,
+  ): Promise<string> {
+    for (let attempt = 1; attempt <= 1000; attempt++) {
+      const suffix = attempt === 1 ? "(copy)" : `(copy ${attempt})`;
+      const candidate = `${base}${suffix}${ext}`;
+      const relative = normalizeRelativePath(parent ? `${parent}/${candidate}` : candidate);
+      try {
+        await fs.stat(await resolveWithinRoot(relative));
+      } catch {
+        return relative;
+      }
+    }
+    throw new ElfinderError("errExists");
   }
 
   async function handleDuplicate(params: ParamBag) {
@@ -1156,8 +1485,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const ext = path.posix.extname(sourceRel);
       const base = path.posix.basename(sourceRel, ext);
       const parent = normalizeRelativePath(path.posix.dirname(sourceRel));
-      const copyName = `${base}(copy)${ext}`;
-      const destRel = normalizeRelativePath(parent ? `${parent}/${copyName}` : copyName);
+      const destRel = await firstFreeCopyName(parent, base, ext);
       await fs.cp(sourceAbs, await resolveWithinRoot(destRel), {
         recursive: true,
         errorOnExist: true,
@@ -1195,6 +1523,13 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const destRel = normalizeRelativePath(dst ? `${dst}/${finalName}` : finalName);
       const destAbs = await resolveWithinRoot(destRel);
 
+      // Moving or copying a folder into its own subtree is unsatisfiable: the
+      // destination would be a child of the thing being moved. fs.cp would recurse
+      // into the copy it is making, and fs.rename fails obscurely.
+      if (destAbs === sourceAbs || destAbs.startsWith(`${sourceAbs}${path.sep}`)) {
+        throw new ElfinderError("errCopyInItself");
+      }
+
       if (cut) {
         // Same as rename: the source path's thumbnails die with the move.
         const owners = await collectThumbOwners(sourceRel, sourceAbs);
@@ -1224,11 +1559,23 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
     await requireRead(target);
     const base = await resolveWithinRoot(target);
+    const needle = q.toLowerCase();
     const files: ElfinderFile[] = [];
+
+    // Bounded: an unbounded walk over a large volume is a slow request that ends in a
+    // response too big to render. Stopping at the cap keeps both in hand, and the walk
+    // now skips .tmb and .chunks, which used to surface thumbnails and half-uploaded
+    // chunk parts as search hits.
     await walkRecursive(base, async (fullPath) => {
-      if (path.basename(fullPath).toLowerCase().includes(q.toLowerCase())) {
-        files.push(await toFileInfo(relFromAbs(fullPath)));
+      if (!path.basename(fullPath).toLowerCase().includes(needle)) {
+        return;
       }
+      const relative = relFromAbs(fullPath);
+      if (!(await permissionFor(relative)).read) {
+        return;
+      }
+      files.push(await toFileInfo(relative));
+      return files.length < MAX_SEARCH_RESULTS;
     });
 
     return NextResponse.json({ files });
@@ -1238,14 +1585,27 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const targets = getTargets(params);
     let total = 0;
     for (const targetHash of targets) {
-      const rel = decodeHash(targetHash);
-      if (!rel) {
+      // Strict, because the volume root decodes to "" and a falsy check would skip it:
+      // asking for the size of the whole volume used to answer 0.
+      const rel = decodeHashStrict(targetHash);
+      if (rel === null) {
         continue;
       }
       await requireRead(rel);
       const abs = await resolveWithinRoot(rel);
       const st = await fs.stat(abs);
-      total += st.size;
+      if (!st.isDirectory()) {
+        total += st.size;
+        continue;
+      }
+      // A directory's own stat size is its inode overhead, not its contents, so the
+      // folder sizes elFinder showed were meaningless.
+      await walkRecursive(abs, async (fullPath) => {
+        const child = await fs.stat(fullPath).catch(() => null);
+        if (child && !child.isDirectory()) {
+          total += child.size;
+        }
+      });
     }
     return NextResponse.json({ size: String(total) });
   }
@@ -1262,7 +1622,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       if (!thumb) {
         return;
       }
-      images[targetHash] = thumb;
+      images[targetHash] = thumbReference(relative, thumb);
       touchedPaths.push(relative);
       freshNames.add(thumb);
     };
@@ -1319,9 +1679,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleArchive(params: ParamBag) {
     const target = requireHash(params.get("target"), "errTrgFolderNotFound");
-    const name = (params.get("name") || "archive.zip").trim();
+    const name = requireEntryName(params.get("name"), "archive.zip");
     const archiveRel = normalizeRelativePath(target ? `${target}/${name}` : name);
     await requireWrite(target);
+    const archiveAbs = await resolveWithinRoot(archiveRel);
+    // writeZip replaces whatever is there, so check before collecting anything.
+    await assertNotOccupied(archiveAbs);
     const zip = new (AdmZip as unknown as new () => ZipAdapter)();
     for (const targetHash of getTargets(params)) {
       const rel = decodeHash(targetHash);
@@ -1332,7 +1695,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const abs = await resolveWithinRoot(rel);
       await addPathToZip(zip, abs, path.posix.basename(rel));
     }
-    zip.writeZip(await resolveWithinRoot(archiveRel));
+    zip.writeZip(archiveAbs);
     return NextResponse.json({ added: [await toFileInfo(archiveRel)] });
   }
 
@@ -1386,58 +1749,233 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       await fs.writeFile(absolute, entry.getData());
     }
 
+    // Only what this archive actually produced. Listing the whole output directory
+    // reported every pre-existing sibling as newly added, which elFinder renders as
+    // duplicate rows when extracting into a folder that already has contents.
+    const topLevel = new Set(
+      planned
+        .map(({ entry }) => safeEntryPath(entry.entryName)?.split("/")[0])
+        .filter((name): name is string => Boolean(name)),
+    );
+
     const added: ElfinderFile[] = [];
-    const children = await fs.readdir(outputAbs, { withFileTypes: true });
-    for (const child of children) {
-      const rel = normalizeRelativePath(
-        outputRel ? `${outputRel}/${child.name}` : child.name,
-      );
+    for (const name of topLevel) {
+      const rel = normalizeRelativePath(outputRel ? `${outputRel}/${name}` : name);
       added.push(await toFileInfo(rel));
     }
 
     return NextResponse.json({ added });
   }
 
-  async function handleZipdl(params: ParamBag) {
+  /**
+   * "Download as zip", which elFinder performs in two requests.
+   *
+   * Phase one selects the items and gets back an opaque id. Phase two asks for that
+   * id with `download=1`, and carries four targets: the current directory, the id,
+   * the filename and the mime type. The previous implementation only understood phase
+   * one, so the download never arrived — and it wrote the archive into the user's own
+   * folder, where it stayed as litter and appeared in listings.
+   *
+   * The archive now lands in the volume's `.tmp` directory under a random id, is
+   * streamed out on phase two and deleted immediately after, and is swept on a TTL if
+   * phase two never comes.
+   */
+  async function handleZipdl(params: ParamBag, rangeHeader: string | null) {
     const targets = getTargets(params);
     if (targets.length === 0) {
       throw new ElfinderError("errCmdParams");
     }
+
+    if (isTruthy(params.get("download"))) {
+      return serveZipdlArchive(targets, rangeHeader);
+    }
+
     const first = decodeHash(targets[0]);
     const parent = normalizeRelativePath(path.posix.dirname(first));
     const parentName = parent ? path.posix.basename(parent) : ROOT_NAME;
     const filename = `${parentName}.zip`;
-    const zipRel = normalizeRelativePath(parent ? `${parent}/${filename}` : filename);
 
-    await requireWrite(parent);
     const zip = new (AdmZip as unknown as new () => ZipAdapter)();
     for (const targetHash of targets) {
       const rel = decodeHash(targetHash);
       if (!rel) {
         continue;
       }
+      // Read access is all this needs. It does not write into the volume, so it must
+      // not demand write on a folder the caller may only read from.
       await requireRead(rel);
       await addPathToZip(zip, await resolveWithinRoot(rel), path.posix.basename(rel));
     }
-    zip.writeZip(await resolveWithinRoot(zipRel));
+
+    await fs.mkdir(TMP_DIR, { recursive: true });
+    await sweepStaleTemp();
+    const id = randomUUID();
+    zip.writeZip(path.resolve(TMP_DIR, `${id}.zip`));
 
     return NextResponse.json({
       zipdl: {
-        file: encodeHash(zipRel),
+        file: id,
         name: filename,
         mime: "application/zip",
       },
     });
   }
 
-  async function handleDim(params: ParamBag) {
-    void params;
-    return NextResponse.json({ dim: "unknown" });
+  /** Phase two of zipdl: stream the staged archive, then delete it. */
+  async function serveZipdlArchive(targets: string[], rangeHeader: string | null) {
+    // targets are [cwd hash, id, name, mime].
+    const id = targets[1] ? safeSegment(targets[1]) : null;
+    const filename = safeSegment(targets[2] ?? "") ?? "archive.zip";
+    if (!id || !/^[0-9a-fA-F-]{36}$/.test(id)) {
+      throw new ElfinderError("errFileNotFound");
+    }
+
+    const archive = path.resolve(TMP_DIR, `${id}.zip`);
+    assertWithin(TMP_DIR, archive);
+
+    let stat;
+    try {
+      stat = await fs.stat(archive);
+    } catch {
+      throw new ElfinderError("errFileNotFound");
+    }
+
+    const response = streamFile(archive, stat, {
+      filename,
+      contentType: "application/zip",
+      disposition: "attachment",
+      rangeHeader,
+      cache: "no-store",
+    });
+
+    // A ranged request is one of several for the same archive, so only a whole-body
+    // response means the client is done with it.
+    if (response.status === 200) {
+      queueDelete(archive);
+    }
+    return response;
   }
 
+  /**
+   * Deletes a staged archive once the response has had a chance to be read.
+   *
+   * The stream is already attached to the response, so the file cannot be unlinked
+   * synchronously on Windows, where an open handle blocks it. The TTL sweep is the
+   * backstop if this never runs.
+   */
+  function queueDelete(absolutePath: string): void {
+    setTimeout(() => {
+      void rmWithRetry(absolutePath, { force: true }).catch(() => {});
+    }, 30_000).unref?.();
+  }
+
+  /** Reads an image file into a buffer, refusing anything that is not a file. */
+  async function readImageSource(target: string): Promise<{ absolute: string; input: Buffer }> {
+    const absolute = await resolveWithinRoot(target);
+    if (!(await fs.stat(absolute)).isFile()) {
+      throw new ElfinderError("errNotFile");
+    }
+    // A buffer rather than a path, as for thumbnails, so libvips never holds the
+    // file open and blocks a later unlink on Windows.
+    return { absolute, input: await fs.readFile(absolute) };
+  }
+
+  async function handleDim(params: ParamBag) {
+    const target = decodeHash(params.get("target"));
+    if (!target) {
+      throw new ElfinderError("errFileNotFound");
+    }
+    await requireRead(target);
+    const { input } = await readImageSource(target);
+
+    let width: number | undefined;
+    let height: number | undefined;
+    try {
+      ({ width, height } = await sharp(input).metadata());
+    } catch {
+      // Not an image sharp can read.
+    }
+    if (!width || !height) {
+      throw new ElfinderError("errUsupportType");
+    }
+    return NextResponse.json({ dim: `${width}x${height}` });
+  }
+
+  /** Largest side resize and crop accept, so one request cannot allocate gigapixels. */
+  const MAX_EDIT_SIDE = 10_000;
+
+  /**
+   * Resizes, crops or rotates an image in place, as the client's resize dialog asks.
+   *
+   * The client computes the final box itself, keeping the aspect ratio if the user
+   * asked it to, so `resize` fills exactly width x height. The format is kept, and
+   * the result replaces the file only once it has been fully written.
+   */
   async function handleResize(params: ParamBag) {
-    void params;
-    return NextResponse.json({ error: ["errCmdNoSupport"] });
+    const target = decodeHash(params.get("target"));
+    if (!target) {
+      throw new ElfinderError("errFileNotFound");
+    }
+    await requireWrite(target);
+    const name = path.posix.basename(target);
+    const badParams = () => new ElfinderError(["errCmdParams", "resize"]);
+
+    const intParam = (key: string, min: number, max: number): number => {
+      const raw = params.get(key) ?? "";
+      const value = Number(raw);
+      if (!/^-?\d+$/.test(raw.trim()) || value < min || value > max) {
+        throw badParams();
+      }
+      return value;
+    };
+
+    const mode = params.get("mode") || "resize";
+    if (mode !== "resize" && mode !== "crop" && mode !== "rotate") {
+      throw badParams();
+    }
+    const box =
+      mode === "rotate"
+        ? null
+        : { width: intParam("width", 1, MAX_EDIT_SIDE), height: intParam("height", 1, MAX_EDIT_SIDE) };
+    const degree = mode === "rotate" ? intParam("degree", -360, 360) : 0;
+    const offset =
+      mode === "crop" ? { left: intParam("x", 0, MAX_EDIT_SIDE), top: intParam("y", 0, MAX_EDIT_SIDE) } : null;
+    const quality = Number(params.get("quality"));
+
+    const { absolute, input } = await readImageSource(target);
+
+    let output: Buffer;
+    try {
+      let image = sharp(input);
+      const { format } = await image.metadata();
+      if (box && offset) {
+        image = image.extract({ ...offset, ...box });
+      } else if (box) {
+        image = image.resize(box.width, box.height, { fit: "fill" });
+      } else {
+        // The client sends a background colour for the corners a rotation exposes;
+        // without one, formats with alpha get transparency and JPEG gets white.
+        const bg = params.get("bg") || (format === "jpeg" ? "#ffffff" : "#00000000");
+        image = image.rotate(degree, { background: bg });
+      }
+      if (format === "jpeg" && quality >= 1 && quality <= 100) {
+        image = image.jpeg({ quality });
+      }
+      output = await image.toBuffer();
+    } catch {
+      throw new ElfinderError(["errResize", name]);
+    }
+
+    // Written aside and renamed over the original, so a failure part-way through
+    // cannot leave a truncated image behind.
+    await fs.mkdir(TMP_DIR, { recursive: true });
+    const staged = path.resolve(TMP_DIR, `${randomUUID()}.resize`);
+    await fs.writeFile(staged, output);
+    await fs.rename(staged, absolute);
+    // The thumbnail name tracks size and mtime, so the old one is now unreachable.
+    await removeThumbsForPaths([target]);
+
+    return NextResponse.json({ changed: [await toFileInfo(target)] });
   }
 
   function toParamBagFromSearchParams(params: URLSearchParams): ParamBag {
@@ -1503,7 +2041,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       case "extract":
         return handleExtract(params);
       case "zipdl":
-        return handleZipdl(params);
+        return handleZipdl(params, rangeHeader);
       case "dim":
         return handleDim(params);
       case "resize":
@@ -1513,11 +2051,121 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
   }
 
+  /**
+   * Performs the merge the client asks for after a chunked upload reports completion.
+   *
+   * The staging directory is normally found from `cid`, but the protocol only promises
+   * `chunk` and `upload[]` on this request, so a scan is the fallback rather than a
+   * failed upload.
+   */
+  async function mergeChunks(options: {
+    base: string;
+    cid: string | null;
+    nameHints: string[];
+    uploadTarget: string;
+    target: string;
+    uploadPathValues: string[];
+  }): Promise<NextResponse> {
+    const base = safeSegment(options.base);
+    if (!base) {
+      throw new ElfinderError("errInvName");
+    }
+
+    const located = await findChunkStaging(base, options.cid);
+    if (!located) {
+      throw new ElfinderError("errUploadTemp");
+    }
+    const { dir: chunkTempDir, parts } = located;
+
+    const destinationDir = await uploadDestination(
+      options.uploadTarget,
+      options.target,
+      options.uploadPathValues,
+    );
+
+    const realFilename = chooseUploadFilename([
+      options.uploadPathValues[0] ?? "",
+      options.nameHints[0] ?? "",
+      base,
+    ]);
+    const finalName = safeSegment(realFilename);
+    if (!finalName) {
+      throw new ElfinderError("errInvName");
+    }
+
+    const finalAbsolute = path.resolve(destinationDir, finalName);
+    assertWithin(destinationDir, finalAbsolute);
+
+    // Streamed part by part: the parts together are the whole file, so reading them
+    // all into memory would defeat the point of having chunked it.
+    const sink = createWriteStream(finalAbsolute);
+    try {
+      for (const partName of parts) {
+        const source = createReadStream(path.resolve(chunkTempDir, partName));
+        await pipeline(source, sink, { end: false });
+      }
+    } finally {
+      await new Promise<void>((resolve) => sink.end(resolve));
+    }
+
+    await rmWithRetry(chunkTempDir, { recursive: true, force: true }).catch(() => {});
+    return NextResponse.json({ added: [await toFileInfo(relFromAbs(finalAbsolute))] });
+  }
+
+  /** Finds the staging directory holding the parts for `base`, preferring `cid`. */
+  async function findChunkStaging(
+    base: string,
+    cid: string | null,
+  ): Promise<{ dir: string; parts: string[] } | null> {
+    const candidates: string[] = [];
+    const cidSegment = cid ? safeSegment(cid) : null;
+    if (cidSegment) {
+      candidates.push(cidSegment);
+    }
+    for (const name of await fs.readdir(CHUNK_DIR).catch(() => [] as string[])) {
+      if (name !== cidSegment) {
+        candidates.push(name);
+      }
+    }
+
+    for (const name of candidates) {
+      const dir = path.resolve(CHUNK_DIR, name);
+      try {
+        assertWithin(CHUNK_DIR, dir);
+      } catch {
+        continue;
+      }
+      const parts = await chunkPartNamesForBase(dir, base);
+      if (parts.length > 0) {
+        return { dir, parts };
+      }
+    }
+    return null;
+  }
+
+  /** Where an upload's files land, honouring the subdirectory in `upload_path[]`. */
+  async function uploadDestination(
+    uploadTarget: string,
+    target: string,
+    uploadPathValues: string[],
+  ): Promise<string> {
+    if (uploadPathValues.length === 0) {
+      return uploadTarget;
+    }
+    const subdir = normalizeRelativePath(path.posix.dirname(uploadPathValues[0]));
+    if (!subdir) {
+      return uploadTarget;
+    }
+    const resolved = await resolveWithinRoot(target ? `${target}/${subdir}` : subdir);
+    await fs.mkdir(resolved, { recursive: true });
+    return resolved;
+  }
+
   async function handleUpload(formData: FormData) {
     // Awaited rather than fired and forgotten: it is a single directory scan, rate
     // limited to once per interval, and a detached promise would not survive the
     // end of a serverless invocation anyway.
-    await sweepAbandonedChunks();
+    await sweepStaleTemp();
 
     const target = requireHash(
       formData.get("target") as string | null,
@@ -1528,6 +2176,21 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     await fs.mkdir(uploadTarget, { recursive: true });
 
     const uploads = formData.getAll("upload[]").filter((f): f is File => f instanceof File);
+
+    // Enforced as well as advertised: a client that ignores uplMaxFile or uplMaxSize,
+    // or a request that never came from elFinder at all, must not be able to fill the
+    // disk. elFinder renders both of these keys with the limit it was told.
+    if (MAX_UPLOAD_FILES > 0 && uploads.length > MAX_UPLOAD_FILES) {
+      throw new ElfinderError("errUploadFile");
+    }
+    if (MAX_UPLOAD_BYTES > 0) {
+      for (const upload of uploads) {
+        if (upload.size > MAX_UPLOAD_BYTES) {
+          throw new ElfinderError(["errUploadFileSize", upload.name || "upload"]);
+        }
+      }
+    }
+
     const chunk = formData.get("chunk");
     const cid = formData.get("cid");
     const range = formData.get("range");
@@ -1543,16 +2206,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       uploads.length > 0
     ) {
       const upload = uploads[0];
-      let destinationDir = uploadTarget;
-      if (uploadPathValues.length > 0) {
-        const firstPathDir = normalizeRelativePath(path.posix.dirname(uploadPathValues[0]));
-        if (firstPathDir) {
-          destinationDir = await resolveWithinRoot(
-            target ? `${target}/${firstPathDir}` : firstPathDir,
-          );
-          await fs.mkdir(destinationDir, { recursive: true });
-        }
-      }
+      const destinationDir = await uploadDestination(uploadTarget, target, uploadPathValues);
 
       // `cid` and `chunk` are client-supplied. Neither may widen the path: both
       // are reduced to a single segment and the result is re-checked against
@@ -1576,66 +2230,60 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         .split(",")
         .map((value) => Number(value.trim()))
         .filter((value) => Number.isFinite(value));
-      const start = rangeParts[0] ?? 0;
       const total = rangeParts.length >= 3 ? rangeParts[2] : Number.POSITIVE_INFINITY;
+
+      // A chunked upload declares its full size up front, which is the only chance to
+      // refuse an oversized file before writing all of it: the per-file check above
+      // only ever sees one slice.
+      if (MAX_UPLOAD_BYTES > 0 && Number.isFinite(total) && total > MAX_UPLOAD_BYTES) {
+        await rmWithRetry(chunkTempDir, { recursive: true, force: true }).catch(() => {});
+        throw new ElfinderError(["errUploadFileSize", chunkName]);
+      }
+
       const chunkStat = await fs.stat(chunkPath);
-      const isLastChunk = Number.isFinite(total) && start + chunkStat.size >= total;
+
+      // Completion is judged by how many bytes have actually landed, not by this
+      // chunk's offset. Chunks are uploaded in parallel, so the slice covering the end
+      // of the file can arrive before the middle ones and would otherwise trigger a
+      // merge over an incomplete set, truncating the result.
+      const partsOnDisk = await chunkPartSizes(chunkTempDir, chunkName);
+      const bytesOnDisk = partsOnDisk.reduce((sum, size) => sum + size, 0);
+      const isLastChunk = Number.isFinite(total) && bytesOnDisk >= total;
 
       if (!isLastChunk) {
-        const realFilename = chunkName.replace(/\.\d+_\d+\.part$/, "");
-        return NextResponse.json({
-          added: [],
-          _chunkmerged: chunkName,
-          _name: realFilename,
-        });
+        return NextResponse.json({ added: [] });
       }
 
-      const chunkDerivedFilename = chunkName.replace(/\.\d+_\d+\.part$/, "");
+      // All parts have landed, so report completion and stop. The merge happens on the
+      // request the client sends next, carrying these two values back as `chunk` and
+      // `upload[]`. Returning the pair on every intermediate chunk, as this used to,
+      // made the client ask to merge after each slice.
       const pathDerivedFilename = uploadPathValues.length > 0 ? uploadPathValues[0] : "";
-      const uploadDerivedFilename = upload.name || "";
       const realFilename = chooseUploadFilename([
         pathDerivedFilename,
-        uploadDerivedFilename,
-        chunkDerivedFilename,
+        upload.name || "",
+        chunkBaseName(chunkName),
       ]);
-      const escapedFilename = realFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const partPattern = new RegExp(`^${escapedFilename}\\.\\d+_\\d+\\.part$`);
-      const chunkPrefix = chunkName.replace(/\.\d+_\d+\.part$/, "");
-      const escapedChunkPrefix = chunkPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const chunkPattern = new RegExp(`^${escapedChunkPrefix}\\.\\d+_\\d+\\.part$`);
-      const allChunkFiles = await fs.readdir(chunkTempDir);
-      const parts = allChunkFiles
-        .filter((name) => partPattern.test(name) || chunkPattern.test(name))
-        .sort((a, b) => {
-          const aMatch = a.match(/\.(\d+)_\d+\.part$/);
-          const bMatch = b.match(/\.(\d+)_\d+\.part$/);
-          const aNum = aMatch ? Number(aMatch[1]) : 0;
-          const bNum = bMatch ? Number(bMatch[1]) : 0;
-          return aNum - bNum;
-        });
+      return NextResponse.json({
+        added: [],
+        _chunkmerged: chunkBaseName(chunkName),
+        _name: realFilename,
+      });
+    }
 
-      if (parts.length === 0) {
-        throw new ElfinderError("errUploadTemp");
-      }
-
-      const finalName = safeSegment(realFilename);
-      if (!finalName) {
-        throw new ElfinderError("errInvName");
-      }
-      const finalAbsolute = path.resolve(destinationDir, finalName);
-      assertWithin(destinationDir, finalAbsolute);
-      await fs.rm(finalAbsolute, { force: true });
-      await fs.writeFile(finalAbsolute, Buffer.alloc(0));
-      for (const partName of parts) {
-        const partBuffer = await fs.readFile(path.resolve(chunkTempDir, partName));
-        await fs.appendFile(finalAbsolute, partBuffer);
-      }
-      await Promise.all(
-        parts.map((partName) => fs.rm(path.resolve(chunkTempDir, partName), { force: true })),
-      );
-
-      const finalRelative = relFromAbs(finalAbsolute);
-      return NextResponse.json({ added: [await toFileInfo(finalRelative)] });
+    // Chunk merge request: `chunk` is set but there is no range and no file, because
+    // the client sends the name string it was given rather than another slice.
+    if (typeof chunk === "string" && chunk.length > 0) {
+      return mergeChunks({
+        base: chunk,
+        cid: typeof cid === "string" ? cid : null,
+        nameHints: formData
+          .getAll("upload[]")
+          .filter((value): value is string => typeof value === "string"),
+        uploadTarget,
+        target,
+        uploadPathValues,
+      });
     }
 
     const added: ElfinderFile[] = [];
@@ -1690,7 +2338,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   /** Establishes the request scope, so permission lookups can find the session. */
   async function withScope<T>(req: NextRequest, run: () => Promise<T>): Promise<T> {
     const session = await resolveSession(req);
-    return scopeStorage.run({ session, cache: new Map() }, run);
+    const connectorUrl = `${req.nextUrl.basePath}${req.nextUrl.pathname}`;
+    return scopeStorage.run(
+      { session, cache: new Map(), connectorUrl, headers: req.headers },
+      run,
+    );
   }
 
   async function GET(req: NextRequest) {

@@ -142,11 +142,11 @@ describe("error envelope (items 5 and 20)", () => {
     expect(JSON.stringify(body)).not.toContain(vol.uploadDir);
   });
 
-  it("reports an unsupported command without a 4xx", async () => {
+  it("reports invalid command parameters without a 4xx", async () => {
     const vol = await makeVolume({ "a.png": "x" });
-    const response = await vol.GET(`cmd=resize&target=${hashOf("a.png")}`);
+    const response = await vol.GET(`cmd=resize&target=${hashOf("a.png")}&mode=teleport`);
 
     expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ error: ["errCmdNoSupport"] });
+    expect(await response.json()).toEqual({ error: ["errCmdParams", "resize"] });
   });
 });
