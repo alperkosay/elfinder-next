@@ -8,7 +8,7 @@ Dosya referansları `packages/elfinder-next/src/` altına göredir.
 
 ## Uygulanan dilim
 
-`fix/security-and-core-hardening` dalında 13 commit. Tamamlanan maddeler:
+Tamamlanan maddeler (`fix/security-and-core-hardening` ve `fix/thumbnail-lifecycle`):
 
 | Madde | Konu |
 |---|---|
@@ -24,6 +24,7 @@ Dosya referansları `packages/elfinder-next/src/` altına göredir.
 | 46-49 | Depo düzeni |
 | 51, 52 | vitest sözleşme testleri ve GitHub Actions CI |
 | 60 | Node desteği 20.3+ olarak daraltıldı |
+| 10, 11, 13 | Thumbnail parmak izi, temizlik ve chunk toplayıcı |
 
 Her değişiklik, düzeltme geri alınmış halde koşturulan bir kontrol denemesiyle
 doğrulandı. Geçici betikler `packages/elfinder-next/test/` altında kalıcı vitest
@@ -33,13 +34,15 @@ oluyor.
 Komutlar:
 
 ```bash
-pnpm test        # vitest, 99 test
+pnpm test        # vitest, 108 test
 pnpm typecheck   # kaynak + testler
 ```
 
-**Açıkta kalan, bu dilimde kapsam dışı olanlar:** madde 10 (bayat thumbnail),
-11 (öksüz thumbnail), 13 (chunk çöpü), 14 (auth kancaları), 15-19 ve 21-30
-(protokol), 31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen).
+**Açıkta kalan:** madde 14 (auth kancaları), 15-19 ve 21-30 (protokol),
+31-43 (mimari ve dağıtım), 45, 50, 53-59 (hijyen ve npm metadata).
+
+Sıradaki en yüksek getirili madde 14. Kütüphane onsuz üretimde kullanılamıyor ve
+tek gerçek API tasarım kararı orada.
 
 ---
 
@@ -219,23 +222,23 @@ elFinder protokolü tam da bunun için `tmb: "1"` sinyalini tanımlamış.
 - [x] Listelemede sadece `"1"` dön, üretimi `cmd=tmb` handler'ına bırak. Handler zaten yazılmış durumda.
 - [x] `Promise.all`'a eşzamanlılık sınırı koy, aksi halde fd tükeniyor
 
-### 10. Bayat thumbnail
+### 10. Bayat thumbnail — YAPILDI
 
 **Yer:** `handler-core.ts:183`
 
 Thumbnail'ler yalnızca yola göre anahtarlanıyor, dosya varsa hemen dönülüyor. Aynı adla yeni içerik yüklenirse küçük resim sonsuza dek eski kalır.
 
-- [ ] Anahtara `mtime` veya boyut kat
+- [x] Anahtara `mtime` veya boyut kat
 
-### 11. Öksüz thumbnail birikmesi
+### 11. Öksüz thumbnail birikmesi — YAPILDI
 
 **Yer:** `handleRm` → `handler-core.ts:430`
 
 Yalnızca silinen hedefin thumbnail'i siliniyor. İçinde 100 görsel olan bir klasörü silince 100 öksüz thumbnail kalıyor. Yeniden adlandırma da aynı çöpü üretiyor, çünkü hash değişiyor. `.tmb` dizini sınırsız büyüyor.
 
-- [ ] Klasör silmede alt ağaçtaki thumbnail'leri de temizle
-- [ ] Rename ve move sonrası eski thumbnail'i sil
-- [ ] Periyodik GC veya TTL düşün
+- [x] Klasör silmede alt ağaçtaki thumbnail'leri de temizle
+- [x] Rename ve move sonrası eski thumbnail'i sil
+- [x] Periyodik GC veya TTL düşün
 
 ### 12. Her şey RAM'e alınıyor — İNDİRME TARAFI YAPILDI
 
@@ -253,11 +256,11 @@ Yalnızca silinen hedefin thumbnail'i siliniyor. İçinde 100 görsel olan bir k
 > tamamını zaten belleğe alıyor. Onu aşmak busboy gibi kendi multipart ayrıştırıcınızı
 > bağlamak demek. Ayrı ve büyük bir iş, sonraya bırakılabilir.
 
-### 13. Chunk çöpü temizlenmiyor
+### 13. Chunk çöpü temizlenmiyor — YAPILDI
 
 `.chunks` altında yarım kalan yüklemeler hiç silinmiyor.
 
-- [ ] TTL ve toplama mekanizması ekle
+- [x] TTL ve toplama mekanizması ekle
 
 ---
 
