@@ -94,6 +94,54 @@ type ZipAdapter = {
 };
 
 /**
+ * Media types that may be rendered inline by the browser.
+ *
+ * Uploaded files are served from the application's own origin, so anything the
+ * browser will execute there runs with the app's cookies. `text/html` and
+ * `image/svg+xml` are the obvious offenders and are deliberately absent: SVG can
+ * carry script. Everything outside this set is sent as a download.
+ */
+const INLINE_SAFE_MIME = new Set([
+  "application/pdf",
+  "audio/aac",
+  "audio/mpeg",
+  "audio/ogg",
+  "audio/wav",
+  "audio/webm",
+  "audio/x-m4a",
+  "image/apng",
+  "image/avif",
+  "image/bmp",
+  "image/gif",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "text/plain",
+  "video/mp4",
+  "video/ogg",
+  "video/quicktime",
+  "video/webm",
+]);
+
+function isInlineSafeMime(mimeType: string): boolean {
+  return INLINE_SAFE_MIME.has(mimeType.split(";")[0].trim().toLowerCase());
+}
+
+/**
+ * Builds a Content-Disposition value that cannot break out of the header.
+ *
+ * A filename may legitimately contain a double quote or a non-ASCII character.
+ * Interpolating it raw lets the first quote terminate the parameter, so the
+ * ASCII form is sanitized and the real name travels in the RFC 5987 parameter.
+ */
+function contentDisposition(filename: string, disposition: "inline" | "attachment"): string {
+  // eslint-disable-next-line no-control-regex
+  const ascii = filename.replace(/[^\x20-\x7e]/g, "_").replace(/["\\]/g, "_");
+  const encoded = encodeURIComponent(filename);
+  return `${disposition}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
+}
+
+/**
  * Normalizes a zip entry name to a relative POSIX path, or returns `null` when
  * the entry cannot be trusted.
  *
@@ -528,12 +576,17 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const filename = path.posix.basename(target);
     const contentType = mime.lookup(filename) || "application/octet-stream";
     const download = params.get("download") === "1";
+    // Only hand back an inline response for types the browser cannot be talked
+    // into executing on this origin; everything else becomes a download even
+    // when elFinder asked to preview it.
+    const disposition = !download && isInlineSafeMime(contentType) ? "inline" : "attachment";
 
     return new NextResponse(data, {
       headers: {
         "Content-Type": contentType,
         "Content-Length": String(data.byteLength),
-        "Content-Disposition": `${download ? "attachment" : "inline"}; filename="${filename}"`,
+        "Content-Disposition": contentDisposition(filename, disposition),
+        "X-Content-Type-Options": "nosniff",
       },
     });
   }
