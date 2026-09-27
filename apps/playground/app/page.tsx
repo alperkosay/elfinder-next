@@ -5,7 +5,7 @@ export default function Home() {
       <button
         onClick={() => {
           window.open(
-            "/elfinder-static/picker.html",
+            "/elfinder/picker.html",
             "Picker",
             "width=800,height=600",
           );

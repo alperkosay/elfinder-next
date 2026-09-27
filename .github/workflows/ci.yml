@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # The connector does a lot of path handling, and more than one bug it has
+        # already hit was Windows-only: backslashes are not separators to
+        # path.posix, and NTFS forbids characters POSIX allows. macOS covers the
+        # case-insensitive-but-not-Windows filesystem, which the case-only rename
+        # test depends on.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # 20.3 is the floor declared in engines, so test it rather than whatever
+        # the latest 20.x happens to be; 22 covers a current release. The floor is
+        # where `File` became global and where sharp's supported range begins.
+        node: ["20.3", "22"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+
+      - name: Build playground
+        # Catches what the unit tests cannot: that the built package still
+        # type-checks and bundles inside a real Next.js app.
+        run: pnpm --filter playground build

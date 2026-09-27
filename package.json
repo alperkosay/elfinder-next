@@ -4,7 +4,9 @@
   "scripts": {
     "build": "pnpm --filter elfinder-next build",
     "dev": "pnpm --filter elfinder-next build && pnpm --filter playground dev",
-    "build:playground": "pnpm --filter elfinder-next build && pnpm --filter playground build"
+    "build:playground": "pnpm --filter elfinder-next build && pnpm --filter playground build",
+    "test": "pnpm --filter elfinder-next test",
+    "typecheck": "pnpm --filter elfinder-next typecheck"
   },
   "packageManager": "pnpm@10.32.1"
 }

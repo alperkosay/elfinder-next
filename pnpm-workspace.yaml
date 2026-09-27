@@ -1,3 +1,10 @@
 packages:
   - apps/*
   - packages/*
+
+# Moved here from apps/playground/pnpm-workspace.yaml. A workspace file inside an
+# app makes pnpm treat that directory as its own workspace root, which breaks
+# `workspace:*` resolution for packages/elfinder-next.
+ignoredBuiltDependencies:
+  - sharp
+  - unrs-resolver

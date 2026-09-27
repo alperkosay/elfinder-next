@@ -18,7 +18,10 @@
   ],
   "scripts": {
     "build": "tsup",
-    "dev": "tsup --watch"
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json"
   },
   "keywords": [
     "elfinder",
@@ -27,6 +30,9 @@
     "connector"
   ],
   "license": "MIT",
+  "engines": {
+    "node": ">=20.3.0"
+  },
   "packageManager": "pnpm@10.32.1",
   "peerDependencies": {
     "next": ">=14"
@@ -39,9 +45,10 @@
   "devDependencies": {
     "@types/adm-zip": "^0.5.7",
     "@types/mime-types": "^3.0.1",
-    "@types/node": "^20",
+    "@types/node": "^22",
     "next": "^16.2.6",
     "tsup": "^8.0.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "vitest": "^5.0.2"
   }
 }

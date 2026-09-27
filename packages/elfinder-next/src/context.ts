@@ -10,7 +10,24 @@ export type ElfinderContext = {
   chunkDir: string;
   publicUrl: string;
   tmbUrl: string;
+  maxArchiveEntries: number;
+  maxArchiveBytes: number;
 };
+
+/**
+ * Ensures a URL prefix ends in a slash, while leaving an empty string empty.
+ *
+ * An empty prefix is meaningful: it tells elFinder that files have no public URL,
+ * so the client addresses them through the connector's `file` command instead.
+ * Coercing `""` to `"/"` would instead claim that files are served from the site
+ * root, which is how uploads end up unreachable behind a wrong URL.
+ */
+function normalizeUrlPrefix(raw: string): string {
+  if (raw === "") {
+    return "";
+  }
+  return raw.endsWith("/") ? raw : `${raw}/`;
+}
 
 export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
   const uploadDir = path.resolve(
@@ -27,7 +44,9 @@ export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
     rootHash: `${volumeId}Lw`,
     tmbDir: path.resolve(uploadDir, ".tmb"),
     chunkDir: path.resolve(uploadDir, ".chunks"),
-    publicUrl: publicUrl.endsWith("/") ? publicUrl : `${publicUrl}/`,
-    tmbUrl: tmbUrl.endsWith("/") ? tmbUrl : `${tmbUrl}/`,
+    publicUrl: normalizeUrlPrefix(publicUrl),
+    tmbUrl: normalizeUrlPrefix(tmbUrl),
+    maxArchiveEntries: options.maxArchiveEntries ?? 10_000,
+    maxArchiveBytes: options.maxArchiveBytes ?? 1024 * 1024 * 1024,
   };
 }
