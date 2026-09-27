@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import fs from "fs/promises";
 import { createReadStream } from "fs";
+import { createHash } from "crypto";
 import { Readable } from "stream";
 import path from "path";
 import mime from "mime-types";
@@ -246,6 +247,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     tmbUrl: TMB_URL,
     maxArchiveEntries: MAX_ARCHIVE_ENTRIES,
     maxArchiveBytes: MAX_ARCHIVE_BYTES,
+    chunkTtlMs: CHUNK_TTL_MS,
   } = ctx;
 
   function normalizeRelativePath(raw: string): string {
@@ -374,6 +376,53 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     }
   }
 
+  /**
+   * Last time abandoned chunk directories were swept, so an upload burst does not
+   * scan the directory on every request.
+   */
+  let lastChunkSweep = 0;
+
+  /**
+   * Deletes chunk directories that have not been touched within the TTL.
+   *
+   * An upload that is cancelled, or whose browser tab is closed, leaves its parts
+   * behind forever: nothing else ever revisits them. A directory's mtime moves as
+   * parts are written into it, so it tracks the last activity for that upload.
+   *
+   * The sweep interval is capped by the TTL itself, which keeps a deliberately
+   * short TTL responsive instead of waiting out a fixed timer.
+   */
+  async function sweepAbandonedChunks(): Promise<void> {
+    const now = Date.now();
+    if (now - lastChunkSweep < Math.min(CHUNK_TTL_MS, 5 * 60_000)) {
+      return;
+    }
+    lastChunkSweep = now;
+
+    let entries;
+    try {
+      entries = await fs.readdir(CHUNK_DIR, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory())
+        .map(async (entry) => {
+          const dir = path.resolve(CHUNK_DIR, entry.name);
+          try {
+            const stat = await fs.stat(dir);
+            if (now - stat.mtimeMs >= CHUNK_TTL_MS) {
+              await rmWithRetry(dir, { recursive: true, force: true });
+            }
+          } catch {
+            // Another request may be mid-upload in this directory.
+          }
+        }),
+    );
+  }
+
   async function ensureUploadDir(): Promise<void> {
     await fs.mkdir(UPLOAD_DIR, { recursive: true });
     await fs.mkdir(TMB_DIR, { recursive: true });
@@ -384,8 +433,38 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return mimeType.startsWith("image/");
   }
 
-  function tmbFilenameFromHash(hash: string): string {
-    return `${hash}.png`;
+  /**
+   * First half of a thumbnail filename: a digest of the source's path.
+   *
+   * Keeping the path identifiable lets thumbnails be deleted without stat-ing the
+   * source, which is necessary because cleanup happens after the file is already
+   * gone.
+   */
+  function thumbPathPrefix(relativePath: string): string {
+    return createHash("sha256")
+      .update(normalizeRelativePath(relativePath))
+      .digest("hex")
+      .slice(0, 24);
+  }
+
+  /**
+   * Thumbnail filename: `<pathDigest>-<contentDigest>.png`.
+   *
+   * The content half changes whenever the source's size or mtime changes, so
+   * replacing a file under the same name produces a different filename instead of
+   * serving the previous image forever. Digesting both halves also bounds the
+   * length: the old scheme embedded the base64 path, which grows without limit as
+   * the tree deepens and can overrun the 255-byte filename limit.
+   */
+  function thumbFilename(
+    relativePath: string,
+    stat: { mtimeMs: number; size: number },
+  ): string {
+    const content = createHash("sha256")
+      .update(`${Math.floor(stat.mtimeMs)}:${stat.size}`)
+      .digest("hex")
+      .slice(0, 12);
+    return `${thumbPathPrefix(relativePath)}-${content}.png`;
   }
 
   function detectMimeFromName(name: string): string {
@@ -424,9 +503,18 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     return "upload.bin";
   }
 
-  /** Returns the thumbnail filename if one is already on disk, without creating it. */
-  async function existingThumbForFile(relativePath: string): Promise<string | null> {
-    const thumbName = tmbFilenameFromHash(encodeHash(normalizeRelativePath(relativePath)));
+  /**
+   * Returns the thumbnail filename if one matching the source's current contents
+   * is already on disk, without creating it.
+   *
+   * The caller passes the stat it already has, so this costs one access() rather
+   * than a second stat of every file in a listing.
+   */
+  async function existingThumbForFile(
+    relativePath: string,
+    stat: { mtimeMs: number; size: number },
+  ): Promise<string | null> {
+    const thumbName = thumbFilename(relativePath, stat);
     try {
       await fs.access(path.resolve(TMB_DIR, thumbName));
       return thumbName;
@@ -437,34 +525,115 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function ensureThumbForFile(relativePath: string): Promise<string | null> {
     const normalized = normalizeRelativePath(relativePath);
-    const existing = await existingThumbForFile(normalized);
+    const absolute = await resolveWithinRoot(normalized);
+
+    let stat;
+    try {
+      stat = await fs.stat(absolute);
+    } catch {
+      return null;
+    }
+
+    const existing = await existingThumbForFile(normalized, stat);
     if (existing) {
       return existing;
     }
 
-    const thumbName = tmbFilenameFromHash(encodeHash(normalized));
+    const thumbName = thumbFilename(normalized, stat);
     const thumbPath = path.resolve(TMB_DIR, thumbName);
 
     try {
       // Read into a buffer so sharp never holds a path-based lock on the source file.
-      const input = await fs.readFile(await resolveWithinRoot(normalized));
+      const input = await fs.readFile(absolute);
       await sharp(input)
         .resize(48, 48, { fit: "inside", withoutEnlargement: true })
         .png()
         .toFile(thumbPath);
-      return thumbName;
     } catch {
       return null;
     }
+
+    // Superseded thumbnails for this path are cleaned up by the caller in one
+    // batch, so a request generating fifty thumbnails scans .tmb once rather than
+    // fifty times.
+    return thumbName;
   }
 
-  async function removeThumbForHash(hash: string): Promise<void> {
-    const thumbPath = path.resolve(TMB_DIR, tmbFilenameFromHash(hash));
-    try {
-      await rmWithRetry(thumbPath, { force: true });
-    } catch {
-      // thumbnail may not exist
+  /**
+   * Deletes every thumbnail belonging to any of `relativePaths`.
+   *
+   * Reads the thumbnail directory once and matches by path digest, rather than
+   * probing per file: cleaning up a folder of a thousand images would otherwise
+   * mean a thousand directory scans. `keep` spares one filename, used when a fresh
+   * thumbnail has just been written for one of the paths.
+   */
+  async function removeThumbsForPaths(
+    relativePaths: string[],
+    keep?: ReadonlySet<string>,
+  ): Promise<void> {
+    if (relativePaths.length === 0) {
+      return;
     }
+    const prefixes = new Set(relativePaths.map((p) => `${thumbPathPrefix(p)}-`));
+
+    let entries: string[];
+    try {
+      entries = await fs.readdir(TMB_DIR);
+    } catch {
+      return;
+    }
+
+    const doomed = entries.filter((name) => {
+      if (keep?.has(name)) {
+        return false;
+      }
+      const dash = name.indexOf("-");
+      return dash > 0 && prefixes.has(name.slice(0, dash + 1));
+    });
+
+    await Promise.all(
+      doomed.map((name) =>
+        rmWithRetry(path.resolve(TMB_DIR, name), { force: true }).catch(() => {
+          // A concurrent request may have removed it already.
+        }),
+      ),
+    );
+  }
+
+  /**
+   * Relative paths whose thumbnails belong to `relative`, gathered before it is
+   * moved or deleted.
+   *
+   * For a directory that means every image inside it: those thumbnails are keyed by
+   * their own paths, so removing only the directory's own key would orphan them.
+   * Non-images are skipped since they never had a thumbnail.
+   */
+  async function collectThumbOwners(relative: string, absolute: string): Promise<string[]> {
+    const isImagePath = (p: string) =>
+      isImageMime(detectMimeFromName(path.posix.basename(p)));
+
+    let isDirectory: boolean;
+    try {
+      isDirectory = (await fs.stat(absolute)).isDirectory();
+    } catch {
+      return [];
+    }
+    if (!isDirectory) {
+      return isImagePath(relative) ? [relative] : [];
+    }
+
+    const owners: string[] = [];
+    try {
+      await walkRecursive(absolute, async (fullPath) => {
+        const childRelative = relFromAbs(fullPath);
+        if (isImagePath(childRelative)) {
+          owners.push(childRelative);
+        }
+      });
+    } catch {
+      // Best effort: a partially readable tree still yields what it can.
+    }
+    return owners;
   }
 
   async function hasSubDirs(absolutePath: string): Promise<0 | 1> {
@@ -523,7 +692,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       // fetch it through cmd=tmb in batches. Generating it here instead would run
       // one sharp resize per image every time a directory is listed, so opening a
       // folder of 500 images would be 500 resizes inside a single request.
-      info.tmb = (await existingThumbForFile(normalized)) ?? "1";
+      info.tmb = (await existingThumbForFile(normalized, stat)) ?? "1";
     }
 
     return info;
@@ -732,8 +901,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         continue;
       }
       const absolute = await resolveWithinRoot(relative);
+      // Gathered before the delete: once the tree is gone there is no way to know
+      // which thumbnails belonged to it.
+      const owners = await collectThumbOwners(relative, absolute);
       await rmWithRetry(absolute, { recursive: true, force: true });
-      await removeThumbForHash(hash);
+      await removeThumbsForPaths(owners);
       removed.push(hash);
     }
 
@@ -757,7 +929,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
     const oldAbsolute = await resolveWithinRoot(oldRelative);
     const newAbsolute = await resolveWithinRoot(newRelative);
     await assertNotOccupied(newAbsolute, oldAbsolute);
+
+    // Thumbnails are keyed by path, so everything under the old name is orphaned
+    // by the rename. Collect first, delete after the rename succeeds.
+    const owners = await collectThumbOwners(oldRelative, oldAbsolute);
     await fs.rename(oldAbsolute, newAbsolute);
+    await removeThumbsForPaths(owners);
 
     return NextResponse.json({
       removed: [targetHash],
@@ -911,7 +1088,10 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const destAbs = await resolveWithinRoot(destRel);
 
       if (cut) {
+        // Same as rename: the source path's thumbnails die with the move.
+        const owners = await collectThumbOwners(sourceRel, sourceAbs);
         await movePath(sourceAbs, destAbs);
+        await removeThumbsForPaths(owners);
         removed.push(targetHash);
       } else {
         // Checked up front so copy and cut report the same errExists with the
@@ -962,6 +1142,20 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
 
   async function handleTmb(params: ParamBag) {
     const images: Record<string, string> = {};
+    const touchedPaths: string[] = [];
+    const freshNames = new Set<string>();
+
+    const generate = async (targetHash: string, relative: string) => {
+      // Generation happens here, not during directory listing, so this is the
+      // request that pays for it.
+      const thumb = await ensureThumbForFile(relative);
+      if (!thumb) {
+        return;
+      }
+      images[targetHash] = thumb;
+      touchedPaths.push(relative);
+      freshNames.add(thumb);
+    };
 
     const targets = getTargets(params);
     if (targets.length > 0) {
@@ -971,34 +1165,29 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
           continue;
         }
         try {
-          // Generation happens here, not during directory listing, so this is
-          // the request that pays for it.
-          const thumb = await ensureThumbForFile(relative);
-          if (thumb) {
-            images[targetHash] = thumb;
-          }
+          await generate(targetHash, relative);
         } catch {
           // ignore invalid target
         }
       }
-      return NextResponse.json({ images });
+    } else {
+      const current = decodeHash(params.get("current"));
+      for (const item of await listDirectory(current)) {
+        if (item.mime === "directory" || !isImageMime(item.mime)) {
+          continue;
+        }
+        const relative = decodeHash(item.hash);
+        if (!relative) {
+          continue;
+        }
+        await generate(item.hash, relative);
+      }
     }
 
-    const current = decodeHash(params.get("current"));
-    const files = await listDirectory(current);
-    for (const item of files) {
-      if (item.mime === "directory" || !isImageMime(item.mime)) {
-        continue;
-      }
-      const relative = decodeHash(item.hash);
-      if (!relative) {
-        continue;
-      }
-      const thumb = await ensureThumbForFile(relative);
-      if (thumb) {
-        images[item.hash] = thumb;
-      }
-    }
+    // One pass for the whole request: drops thumbnails superseded by the ones just
+    // written, so .tmb does not grow by one file per edit.
+    await removeThumbsForPaths(touchedPaths, freshNames);
+
     return NextResponse.json({ images });
   }
 
@@ -1206,6 +1395,11 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   }
 
   async function handleUpload(formData: FormData) {
+    // Awaited rather than fired and forgotten: it is a single directory scan, rate
+    // limited to once per interval, and a detached promise would not survive the
+    // end of a serverless invocation anyway.
+    await sweepAbandonedChunks();
+
     const target = requireHash(
       formData.get("target") as string | null,
       "errTrgFolderNotFound",

@@ -51,6 +51,12 @@ export type ElfinderOptions = {
    * Guards against compression bombs. Default: 1 GiB
    */
   maxArchiveBytes?: number;
+  /**
+   * How long an in-progress chunked upload may sit untouched before its parts are
+   * deleted, in milliseconds. A cancelled or abandoned upload leaves parts behind
+   * that nothing else ever revisits. Default: 24 hours
+   */
+  chunkTtlMs?: number;
 };
 
 export type ElfinderHandlers = {

@@ -102,6 +102,120 @@ describe("cmd=tmb generates thumbnails on demand (item 9)", () => {
   });
 });
 
+describe("a replaced file gets a fresh thumbnail (item 10)", () => {
+  it("changes the thumbnail name when the source contents change", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    const target = hashOf("a.png");
+
+    const first = (await json(await vol.GET(`cmd=tmb&targets[]=${target}`))).images[target];
+
+    // Same path, different image. The old scheme keyed thumbnails by path alone
+    // and served the stale one forever.
+    const replacement = await sharp({
+      create: { width: 120, height: 90, channels: 3, background: { r: 200, g: 0, b: 0 } },
+    })
+      .png()
+      .toBuffer();
+    await fs.writeFile(vol.at("a.png"), replacement);
+    // Some filesystems have coarse mtime granularity; make the change unambiguous.
+    const future = new Date(Date.now() + 2000);
+    await fs.utimes(vol.at("a.png"), future, future);
+
+    const second = (await json(await vol.GET(`cmd=tmb&targets[]=${target}`))).images[target];
+
+    expect(second).not.toBe(first);
+    const meta = await sharp(path.join(vol.uploadDir, ".tmb", second)).metadata();
+    expect((meta.width ?? 0) / (meta.height ?? 1)).toBeCloseTo(120 / 90, 1);
+  });
+
+  it("reports the stale thumbnail as pending rather than serving it", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    await vol.GET(`cmd=tmb&targets[]=${hashOf("a.png")}`);
+
+    await fs.writeFile(vol.at("a.png"), Buffer.concat([png, Buffer.alloc(16)]));
+    const future = new Date(Date.now() + 2000);
+    await fs.utimes(vol.at("a.png"), future, future);
+
+    const body = await json(await vol.GET(`cmd=open&target=${ROOT_HASH}`));
+    const entry = body.files.find((f: any) => f.name === "a.png");
+    expect(entry.tmb).toBe("1");
+  });
+
+  it("does not accumulate a thumbnail per edit", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    const target = hashOf("a.png");
+
+    for (let i = 1; i <= 3; i++) {
+      await fs.writeFile(vol.at("a.png"), Buffer.concat([png, Buffer.alloc(i)]));
+      const future = new Date(Date.now() + i * 2000);
+      await fs.utimes(vol.at("a.png"), future, future);
+      await vol.GET(`cmd=tmb&targets[]=${target}`);
+    }
+
+    expect(await thumbCount(vol.uploadDir)).toBe(1);
+  });
+
+  it("keeps thumbnail filenames short for a deeply nested path", async () => {
+    // The old scheme embedded the base64 path, which grows without bound and can
+    // overrun the 255-byte filename limit.
+    const deep = Array.from({ length: 20 }, (_, i) => `level-${i}-with-a-longish-name`).join("/");
+    const vol = await makeVolume({ [`${deep}/a.png`]: png });
+    const target = hashOf(`${deep}/a.png`);
+
+    const body = await json(await vol.GET(`cmd=tmb&targets[]=${target}`));
+    expect(body.images[target]).toBeDefined();
+    expect(body.images[target].length).toBeLessThan(64);
+  });
+});
+
+describe("abandoned chunk directories are swept (item 13)", () => {
+  /** Sends one non-final chunk, which leaves its part on disk. */
+  async function startUpload(vol: Awaited<ReturnType<typeof makeVolume>>, cid: string) {
+    const form = new FormData();
+    form.set("cmd", "upload");
+    form.set("target", ROOT_HASH);
+    form.set("chunk", `big.bin.0_9.part`);
+    form.set("cid", cid);
+    form.set("range", "0,4,9999");
+    form.append("upload[]", new File(["PART"], "blob"), "blob");
+    return vol.POST(form);
+  }
+
+  const chunkDirs = async (uploadDir: string) =>
+    (await fs.readdir(path.join(uploadDir, ".chunks")).catch(() => [])).sort();
+
+  it("keeps parts that are still within the TTL", async () => {
+    const vol = await makeVolume({}, { chunkTtlMs: 60_000 });
+    await startUpload(vol, "alpha");
+    expect(await chunkDirs(vol.uploadDir)).toEqual(["alpha"]);
+
+    // A second upload triggers another sweep; the first is still fresh.
+    await startUpload(vol, "beta");
+    expect(await chunkDirs(vol.uploadDir)).toEqual(["alpha", "beta"]);
+  });
+
+  it("removes parts left behind beyond the TTL", async () => {
+    const vol = await makeVolume({}, { chunkTtlMs: 50 });
+    await startUpload(vol, "abandoned");
+    expect(await chunkDirs(vol.uploadDir)).toEqual(["abandoned"]);
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    // The next upload sweeps the stale directory before writing its own.
+    await startUpload(vol, "current");
+    expect(await chunkDirs(vol.uploadDir)).toEqual(["current"]);
+  });
+
+  it("leaves the chunk directory itself in place", async () => {
+    const vol = await makeVolume({}, { chunkTtlMs: 50 });
+    await startUpload(vol, "gone");
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await startUpload(vol, "kept");
+
+    expect(await vol.exists(".chunks")).toBe(true);
+  });
+});
+
 describe("deleting a file removes its thumbnail", () => {
   it("drops the thumbnail when the file itself is removed", async () => {
     const vol = await makeVolume({ "a.png": png });
@@ -113,17 +227,43 @@ describe("deleting a file removes its thumbnail", () => {
     expect(await thumbCount(vol.uploadDir)).toBe(0);
   });
 
-  it("leaves thumbnails behind for images inside a deleted folder", async () => {
-    // Known gap, REVIEW.md item 11: only the named target's thumbnail is removed,
-    // so deleting a folder orphans the thumbnails of everything inside it. This
-    // test pins the current behaviour so the fix has something to flip.
-    const vol = await makeVolume({ "gallery/a.png": png, "gallery/b.png": png });
+  it("drops the thumbnails of images inside a deleted folder (item 11)", async () => {
+    const vol = await makeVolume({
+      "gallery/a.png": png,
+      "gallery/nested/b.png": png,
+      "keep.png": png,
+    });
     await vol.GET(
-      `cmd=tmb&targets[]=${hashOf("gallery/a.png")}&targets[]=${hashOf("gallery/b.png")}`,
+      `cmd=tmb&targets[]=${hashOf("gallery/a.png")}` +
+        `&targets[]=${hashOf("gallery/nested/b.png")}&targets[]=${hashOf("keep.png")}`,
     );
-    expect(await thumbCount(vol.uploadDir)).toBe(2);
+    expect(await thumbCount(vol.uploadDir)).toBe(3);
 
     await vol.GET(`cmd=rm&targets[]=${hashOf("gallery")}`);
-    expect(await thumbCount(vol.uploadDir)).toBe(2);
+
+    // Only the thumbnail for the file that survived should remain.
+    expect(await thumbCount(vol.uploadDir)).toBe(1);
+  });
+
+  it("drops the old thumbnail when a file is renamed", async () => {
+    const vol = await makeVolume({ "a.png": png });
+    await vol.GET(`cmd=tmb&targets[]=${hashOf("a.png")}`);
+    expect(await thumbCount(vol.uploadDir)).toBe(1);
+
+    await vol.GET(`cmd=rename&target=${hashOf("a.png")}&name=b.png`);
+
+    // Keyed by path, so the old name's thumbnail is now unreachable.
+    expect(await thumbCount(vol.uploadDir)).toBe(0);
+  });
+
+  it("drops the old thumbnails when a folder is moved", async () => {
+    const vol = await makeVolume({ "gallery/a.png": png, "dest/": "" });
+    await vol.GET(`cmd=tmb&targets[]=${hashOf("gallery/a.png")}`);
+    expect(await thumbCount(vol.uploadDir)).toBe(1);
+
+    await vol.GET(
+      `cmd=paste&cut=1&dst=${hashOf("dest")}&targets[]=${hashOf("gallery")}`,
+    );
+    expect(await thumbCount(vol.uploadDir)).toBe(0);
   });
 });

@@ -12,6 +12,7 @@ export type ElfinderContext = {
   tmbUrl: string;
   maxArchiveEntries: number;
   maxArchiveBytes: number;
+  chunkTtlMs: number;
 };
 
 /**
@@ -48,5 +49,6 @@ export function resolveContext(options: ElfinderOptions = {}): ElfinderContext {
     tmbUrl: normalizeUrlPrefix(tmbUrl),
     maxArchiveEntries: options.maxArchiveEntries ?? 10_000,
     maxArchiveBytes: options.maxArchiveBytes ?? 1024 * 1024 * 1024,
+    chunkTtlMs: options.chunkTtlMs ?? 24 * 60 * 60 * 1000,
   };
 }
