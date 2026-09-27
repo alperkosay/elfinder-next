@@ -28,6 +28,31 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Throws unless `absolute` is `root` itself or sits underneath it. */
+function assertWithin(root: string, absolute: string): void {
+  if (absolute !== root && !absolute.startsWith(`${root}${path.sep}`)) {
+    throw new ElfinderError("errAccess");
+  }
+}
+
+/**
+ * Reduces a client-supplied value to a single path segment, or `null` when it
+ * cannot be made into one.
+ *
+ * Both `/` and `\` count as separators. `path.posix.basename` leaves backslashes
+ * alone, so on Windows a value such as `..\..\evil.txt` survives basename intact
+ * and is then split by `path.resolve`, landing outside the intended directory.
+ */
+function safeSegment(raw: string): string | null {
+  const last = raw.replace(/\\/g, "/").split("/").pop() ?? "";
+  // eslint-disable-next-line no-control-regex
+  const cleaned = last.replace(/[\u0000-\u001f]/g, "").trim();
+  if (!cleaned || cleaned === "." || cleaned === "..") {
+    return null;
+  }
+  return cleaned;
+}
+
 async function rmWithRetry(
   absolutePath: string,
   options?: { recursive?: boolean; force?: boolean },
@@ -117,10 +142,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
   function resolveWithinRoot(relativePath: string): string {
     const safeRelative = normalizeRelativePath(relativePath);
     const absolute = path.resolve(UPLOAD_DIR, safeRelative);
-    const rootPrefix = `${UPLOAD_DIR}${path.sep}`;
-    if (absolute !== UPLOAD_DIR && !absolute.startsWith(rootPrefix)) {
-      throw new ElfinderError("errAccess");
-    }
+    assertWithin(UPLOAD_DIR, absolute);
     return absolute;
   }
 
@@ -860,14 +882,22 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         }
       }
 
-      const chunkNamespace =
-        typeof cid === "string" && cid.trim().length > 0
-          ? cid.trim()
-          : encodeHash(relFromAbs(destinationDir));
+      // `cid` and `chunk` are client-supplied. Neither may widen the path: both
+      // are reduced to a single segment and the result is re-checked against
+      // CHUNK_DIR before anything is written.
+      const chunkName = safeSegment(chunk);
+      if (!chunkName) {
+        throw new ElfinderError("errInvName");
+      }
+
+      const cidSegment = typeof cid === "string" ? safeSegment(cid) : null;
+      const chunkNamespace = cidSegment ?? encodeHash(relFromAbs(destinationDir));
       const chunkTempDir = path.resolve(CHUNK_DIR, chunkNamespace);
+      assertWithin(CHUNK_DIR, chunkTempDir);
       await fs.mkdir(chunkTempDir, { recursive: true });
 
-      const chunkPath = path.resolve(chunkTempDir, path.posix.basename(chunk));
+      const chunkPath = path.resolve(chunkTempDir, chunkName);
+      assertWithin(chunkTempDir, chunkPath);
       await fs.writeFile(chunkPath, Buffer.from(await upload.arrayBuffer()));
 
       const rangeParts = range
@@ -880,15 +910,15 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       const isLastChunk = Number.isFinite(total) && start + chunkStat.size >= total;
 
       if (!isLastChunk) {
-        const realFilename = chunk.replace(/\.\d+_\d+\.part$/, "");
+        const realFilename = chunkName.replace(/\.\d+_\d+\.part$/, "");
         return NextResponse.json({
           added: [],
-          _chunkmerged: chunk,
+          _chunkmerged: chunkName,
           _name: realFilename,
         });
       }
 
-      const chunkDerivedFilename = chunk.replace(/\.\d+_\d+\.part$/, "");
+      const chunkDerivedFilename = chunkName.replace(/\.\d+_\d+\.part$/, "");
       const pathDerivedFilename = uploadPathValues.length > 0 ? uploadPathValues[0] : "";
       const uploadDerivedFilename = upload.name || "";
       const realFilename = chooseUploadFilename([
@@ -898,7 +928,7 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
       ]);
       const escapedFilename = realFilename.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const partPattern = new RegExp(`^${escapedFilename}\\.\\d+_\\d+\\.part$`);
-      const chunkPrefix = chunk.replace(/\.\d+_\d+\.part$/, "");
+      const chunkPrefix = chunkName.replace(/\.\d+_\d+\.part$/, "");
       const escapedChunkPrefix = chunkPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const chunkPattern = new RegExp(`^${escapedChunkPrefix}\\.\\d+_\\d+\\.part$`);
       const allChunkFiles = await fs.readdir(chunkTempDir);
@@ -916,7 +946,12 @@ export function createElfinderHandlers(ctx: ElfinderContext): ElfinderHandlers {
         throw new ElfinderError("errUploadTemp");
       }
 
-      const finalAbsolute = path.resolve(destinationDir, path.posix.basename(realFilename));
+      const finalName = safeSegment(realFilename);
+      if (!finalName) {
+        throw new ElfinderError("errInvName");
+      }
+      const finalAbsolute = path.resolve(destinationDir, finalName);
+      assertWithin(destinationDir, finalAbsolute);
       await fs.rm(finalAbsolute, { force: true });
       await fs.writeFile(finalAbsolute, Buffer.alloc(0));
       for (const partName of parts) {
